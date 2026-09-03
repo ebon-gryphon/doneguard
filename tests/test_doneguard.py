@@ -81,8 +81,8 @@ class DoneGuardTests(unittest.TestCase):
         ))
         result = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
         self.assertIn("systemMessage", result)
-        self.assertNotIn("Needs attention", result["systemMessage"])
-        self.assertIn("successful verification", result["systemMessage"])
+        self.assertNotIn("需要处理：", result["systemMessage"])
+        self.assertIn("已找到成功的验证记录", result["systemMessage"])
 
     def test_failed_verification_is_reported(self) -> None:
         self.start_and_edit()
@@ -93,7 +93,7 @@ class DoneGuardTests(unittest.TestCase):
             tool_response=json.dumps({"exit_code": 1, "output": "failed"}),
         ))
         result = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
-        self.assertIn("latest recorded test command failed", result["systemMessage"])
+        self.assertIn("测试没有通过", result["systemMessage"])
 
     def test_successful_verification_uses_transcript_fallback(self) -> None:
         self.start_and_edit()
@@ -122,8 +122,8 @@ class DoneGuardTests(unittest.TestCase):
         ))
 
         result = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
-        self.assertNotIn("Needs attention", result["systemMessage"])
-        self.assertIn("successful verification", result["systemMessage"])
+        self.assertNotIn("需要处理：", result["systemMessage"])
+        self.assertIn("已找到成功的验证记录", result["systemMessage"])
 
     def test_failed_verification_uses_transcript_command_fallback(self) -> None:
         self.start_and_edit()
@@ -152,7 +152,7 @@ class DoneGuardTests(unittest.TestCase):
         ))
 
         result = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
-        self.assertIn("latest recorded test command failed", result["systemMessage"])
+        self.assertIn("测试没有通过", result["systemMessage"])
 
     def test_observe_mode_saves_without_ui_output(self) -> None:
         (self.repo / ".doneguard.json").write_text('{"mode":"observe"}\n', encoding="utf-8")
@@ -255,8 +255,8 @@ class DoneGuardTests(unittest.TestCase):
                 tool_response={"exit_code": exit_code},
             ))
         message = doneguard.handle_hook(self.event("Stop"))["systemMessage"]
-        self.assertNotIn("Needs attention", message)
-        self.assertIn("successful verification", message)
+        self.assertNotIn("需要处理：", message)
+        self.assertIn("已找到成功的验证记录", message)
 
     def test_untracked_debug_marker_is_reported(self) -> None:
         self.start_and_edit()
@@ -357,6 +357,41 @@ class DoneGuardTests(unittest.TestCase):
         self.assertTrue(report["workspace_fingerprint"].startswith("sha256:"))
         self.assertEqual(report["verification_evidence"][0]["exit_code_source"], "tool_response")
 
+    def test_report_explains_missing_verification_in_plain_chinese(self) -> None:
+        self.start_and_edit()
+        doneguard.handle_hook(self.event("Stop"))
+        report = doneguard.latest_report(self.repo)
+        display = report["display"]
+        self.assertEqual(display["headline"], "暂时还不能确认任务已完成")
+        self.assertIn("最后一次修改之后", display["blockers"][0]["detail"])
+        self.assertIn("请运行", display["blockers"][0]["next_step"])
+        self.assertIn("提醒模式", display["mode_label"])
+        self.assertEqual(display["checks"][1]["title"], "测试与构建记录")
+
+    def test_success_report_uses_plain_chinese_and_keeps_raw_evidence(self) -> None:
+        self.start_and_edit()
+        doneguard.handle_hook(self.event(
+            "PostToolUse",
+            tool_name="Bash",
+            tool_input={"command": "pytest -q"},
+            tool_response={"exit_code": 0},
+        ))
+        doneguard.handle_hook(self.event("Stop"))
+        report = doneguard.latest_report(self.repo)
+        self.assertEqual(report["display"]["headline"], "任务已完成检查")
+        self.assertEqual(report["display"]["passed"][0]["title"], "已找到成功的验证记录")
+        self.assertIn("successful verification recorded", report["passed"][0])
+
+    def test_html_report_leads_with_chinese_explanation(self) -> None:
+        self.start_and_edit()
+        doneguard.handle_hook(self.event("Stop"))
+        report = doneguard.latest_report(self.repo)
+        rendered = doneguard.report_html(report)
+        self.assertIn("DoneGuard 检查了什么", rendered)
+        self.assertIn("为什么暂时不能确认完成", rendered)
+        self.assertIn("代码改动后还没有验证", rendered)
+        self.assertIn("查看技术详情", rendered)
+
     def configure_required_coverage(self, lines: float = 90) -> None:
         config = {
             "schema_version": 2,
@@ -391,7 +426,7 @@ class DoneGuardTests(unittest.TestCase):
             tool_response={"exit_code": 0},
         ))
         result = doneguard.handle_hook(self.event("Stop"))
-        self.assertNotIn("Needs attention", result["systemMessage"])
+        self.assertNotIn("需要处理：", result["systemMessage"])
         report = doneguard.latest_report(self.repo)
         self.assertEqual(report["verification_coverage"]["python-tests"], ["app.py"])
         self.assertIn("lines 90.00%", result["systemMessage"])
@@ -406,7 +441,7 @@ class DoneGuardTests(unittest.TestCase):
         ))
         message = doneguard.handle_hook(self.event("Stop"))["systemMessage"]
         self.assertIn("lines coverage 50.00% is below 80.00%", message)
-        self.assertIn("Needs attention", message)
+        self.assertIn("需要处理：", message)
 
     def test_artifact_changed_after_verification_is_rejected(self) -> None:
         self.configure_required_coverage()
@@ -437,7 +472,7 @@ class DoneGuardTests(unittest.TestCase):
             tool_input={"command": "pytest -q"}, tool_response={"exit_code": 0},
         ))
         message = doneguard.handle_hook(self.event("Stop"))["systemMessage"]
-        self.assertIn("not covered by a required verification rule: app.py", message)
+        self.assertIn("部分代码改动没有对应的必做检查", message)
 
     def test_fingerprint_budget_failure_is_visible(self) -> None:
         (self.repo / ".doneguard.json").write_text(
@@ -570,7 +605,7 @@ class DoneGuardTests(unittest.TestCase):
             tool_input={"command": "make test"}, tool_response={"exit_code": 0},
         ))
         first = doneguard.handle_hook(self.event("Stop"))["systemMessage"]
-        self.assertNotIn("Needs attention", first)
+        self.assertNotIn("需要处理：", first)
         guide.write_text("version two\n", encoding="utf-8")
         second = doneguard.handle_hook(self.event("Stop"))["systemMessage"]
         self.assertIn("required verification docs-check was not recorded", second)
@@ -619,7 +654,7 @@ class DoneGuardTests(unittest.TestCase):
         doneguard.handle_hook(self.event("SessionStart", source="startup"))
         (self.repo / "scratch.py").write_text('TEXT = """unterminated\n', encoding="utf-8")
         message = doneguard.handle_hook(self.event("Stop"))["systemMessage"]
-        self.assertIn("debug marker scan is incomplete", message)
+        self.assertIn("调试内容没有检查完整", message)
         report = doneguard.latest_report(self.repo)
         self.assertFalse(report["debug_scan"]["complete"])
 
@@ -636,7 +671,7 @@ class DoneGuardTests(unittest.TestCase):
             tool_input={"command": "*** Update File: app.py"},
         ))
         message = doneguard.handle_hook(self.event("Stop"))["systemMessage"]
-        self.assertIn("blocking debug markers found", message)
+        self.assertIn("发现不允许保留的调试内容", message)
 
 
 if __name__ == "__main__":

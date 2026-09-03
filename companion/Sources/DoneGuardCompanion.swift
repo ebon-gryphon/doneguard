@@ -7,6 +7,52 @@ extension Notification.Name {
     static let doneGuardHide = Notification.Name("DoneGuardHide")
 }
 
+struct DisplayCheck: Codable, Equatable, Identifiable {
+    let title: String
+    let status: String
+    let detail: String
+
+    var id: String { title }
+}
+
+struct DisplayFinding: Codable, Equatable, Identifiable {
+    let title: String
+    let detail: String
+    let nextStep: String
+    let technicalDetail: String
+
+    var id: String { title + technicalDetail }
+
+    enum CodingKeys: String, CodingKey {
+        case title
+        case detail
+        case nextStep = "next_step"
+        case technicalDetail = "technical_detail"
+    }
+}
+
+struct ReportDisplay: Codable, Equatable {
+    let headline: String
+    let summary: String
+    let modeLabel: String
+    let checks: [DisplayCheck]
+    let blockers: [DisplayFinding]
+    let warnings: [DisplayFinding]
+    let passed: [DisplayFinding]
+    let filesSummary: String
+
+    enum CodingKeys: String, CodingKey {
+        case headline
+        case summary
+        case modeLabel = "mode_label"
+        case checks
+        case blockers
+        case warnings
+        case passed
+        case filesSummary = "files_summary"
+    }
+}
+
 struct CompletionReport: Codable, Identifiable, Equatable {
     let reportID: String
     let projectName: String
@@ -17,6 +63,7 @@ struct CompletionReport: Codable, Identifiable, Equatable {
     let warnings: [String]
     let blockers: [String]
     let changedPaths: [String]
+    let display: ReportDisplay?
 
     var id: String { reportID }
 
@@ -30,7 +77,74 @@ struct CompletionReport: Codable, Identifiable, Equatable {
         case warnings
         case blockers
         case changedPaths = "changed_paths"
+        case display
     }
+
+    var headline: String {
+        if let display { return display.headline }
+        if !blockers.isEmpty { return "暂时还不能确认任务已完成" }
+        if !warnings.isEmpty { return "任务已有完成证据，但还有提醒" }
+        return "任务已完成检查"
+    }
+
+    var plainSummary: String {
+        if let display { return display.summary }
+        if !blockers.isEmpty { return "发现 \(blockers.count) 个需要处理的问题。打开报告可以查看原因和建议。" }
+        if !warnings.isEmpty { return "没有发现阻断问题，同时有 \(warnings.count) 项内容建议你确认。" }
+        return "没有发现需要阻止交付的问题。"
+    }
+
+    var modeLabel: String {
+        if let display { return display.modeLabel }
+        switch mode {
+        case "strict": return "严格模式（证据不足时会让 Codex 再检查一次）"
+        case "observe": return "观察模式（只记录，不弹出提醒）"
+        default: return "提醒模式（只提示，不阻止任务结束）"
+        }
+    }
+
+    var checkedAtLabel: String {
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var date = parser.date(from: checkedAt)
+        if date == nil {
+            parser.formatOptions = [.withInternetDateTime]
+            date = parser.date(from: checkedAt)
+        }
+        guard let date else { return checkedAt }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy年M月d日 HH:mm"
+        return formatter.string(from: date)
+    }
+
+    private func legacyFindings(_ values: [String], category: String) -> [DisplayFinding] {
+        values.enumerated().map { index, value in
+            let title: String
+            let detail: String
+            let nextStep: String
+            switch category {
+            case "blocker":
+                title = "问题 \(index + 1) 需要处理"
+                detail = "这项检查没有满足当前项目的完成要求。"
+                nextStep = "请把技术详情交给 Codex 或开发者处理，然后重新检查。"
+            case "warning":
+                title = "提醒 \(index + 1)"
+                detail = "这项内容不会阻止任务结束，但建议交付前确认。"
+                nextStep = "如果不确定是否有影响，可以请 Codex 进一步检查。"
+            default:
+                title = "已确认项目 \(index + 1)"
+                detail = "DoneGuard 找到了支持任务完成的检查证据。"
+                nextStep = ""
+            }
+            return DisplayFinding(title: title, detail: detail, nextStep: nextStep, technicalDetail: value)
+        }
+    }
+
+    var displayBlockers: [DisplayFinding] { display?.blockers ?? legacyFindings(blockers, category: "blocker") }
+    var displayWarnings: [DisplayFinding] { display?.warnings ?? legacyFindings(warnings, category: "warning") }
+    var displayPassed: [DisplayFinding] { display?.passed ?? legacyFindings(passed, category: "passed") }
 }
 
 struct ReportEvent: Codable {
@@ -217,22 +331,6 @@ struct SummaryView: View {
     let showDetails: () -> Void
     let postpone: () -> Void
 
-    private var title: String {
-        if !report.blockers.isEmpty { return "发现需要处理的问题" }
-        if !report.warnings.isEmpty { return "任务完成，有几项提醒" }
-        return "任务已完成"
-    }
-
-    private var summary: String {
-        if !report.blockers.isEmpty {
-            return "找到 \(report.blockers.count) 个需要处理的问题"
-        }
-        if !report.warnings.isEmpty {
-            return "检查完成，同时留下 \(report.warnings.count) 项提醒"
-        }
-        return "没有发现阻断项"
-    }
-
     private var accent: Color {
         report.status == "success" ? Color(red: 0.12, green: 0.55, blue: 0.43) : Color(red: 0.86, green: 0.47, blue: 0.10)
     }
@@ -250,9 +348,10 @@ struct SummaryView: View {
                         .lineLimit(1)
                         .foregroundStyle(.secondary)
                 }
-                Text(title)
+                Text(report.headline)
                     .font(.system(size: 18, weight: .bold, design: .rounded))
-                Text(summary)
+                    .lineLimit(2)
+                Text(report.plainSummary)
                     .font(.system(size: 12.5))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -279,11 +378,69 @@ struct SummaryView: View {
     }
 }
 
-struct ReportSection: View {
+struct CheckOverview: View {
+    let checks: [DisplayCheck]
+
+    private func color(for status: String) -> Color {
+        switch status {
+        case "issue": return .red
+        case "warning": return .orange
+        case "passed": return .green
+        default: return .secondary
+        }
+    }
+
+    private func icon(for status: String) -> String {
+        switch status {
+        case "issue": return "xmark.circle.fill"
+        case "warning": return "exclamationmark.triangle.fill"
+        case "passed": return "checkmark.circle.fill"
+        default: return "minus.circle.fill"
+        }
+    }
+
+    var body: some View {
+        if !checks.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("DoneGuard 检查了什么")
+                    .font(.headline)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                    ForEach(checks) { check in
+                        HStack(alignment: .top, spacing: 9) {
+                            Image(systemName: icon(for: check.status))
+                                .foregroundStyle(color(for: check.status))
+                                .padding(.top, 2)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(check.title).font(.subheadline.bold())
+                                Text(check.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, minHeight: 82, alignment: .topLeading)
+                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+                        .overlay(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(color(for: check.status))
+                                .frame(width: 3)
+                        }
+                    }
+                }
+            }
+            .padding(16)
+            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 14))
+        }
+    }
+}
+
+struct FindingSection: View {
     let title: String
     let icon: String
     let color: Color
-    let values: [String]
+    let values: [DisplayFinding]
 
     var body: some View {
         if !values.isEmpty {
@@ -291,10 +448,32 @@ struct ReportSection: View {
                 Label(title, systemImage: icon)
                     .font(.headline)
                     .foregroundStyle(color)
-                ForEach(Array(values.enumerated()), id: \.offset) { _, value in
-                    HStack(alignment: .top, spacing: 8) {
-                        Circle().fill(color).frame(width: 5, height: 5).padding(.top, 8)
-                        Text(value).textSelection(.enabled)
+                ForEach(values) { value in
+                    HStack(alignment: .top, spacing: 9) {
+                        Circle().fill(color).frame(width: 6, height: 6).padding(.top, 7)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(value.title).font(.subheadline.bold())
+                            Text(value.detail)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if !value.nextStep.isEmpty {
+                                HStack(alignment: .top, spacing: 5) {
+                                    Text("建议").font(.caption.bold()).foregroundStyle(color)
+                                    Text(value.nextStep).font(.callout)
+                                }
+                            }
+                            if !value.technicalDetail.isEmpty {
+                                DisclosureGroup("查看技术详情") {
+                                    Text(value.technicalDetail)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.top, 4)
+                                }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 }
             }
@@ -330,19 +509,40 @@ struct DetailView: View {
                         MascotImage(status: report.status).frame(width: 72, height: 72)
                         VStack(alignment: .leading, spacing: 5) {
                             Text(report.projectName).font(.title2.bold())
-                            Text("检查时间  \(report.checkedAt)").font(.caption).foregroundStyle(.secondary)
-                            Text("模式  \(report.mode)").font(.caption).foregroundStyle(.secondary)
+                            Text("检查时间  \(report.checkedAtLabel)").font(.caption).foregroundStyle(.secondary)
+                            Text(report.modeLabel).font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    ReportSection(title: "需要处理", icon: "exclamationmark.octagon.fill", color: .red, values: report.blockers)
-                    ReportSection(title: "提醒", icon: "exclamationmark.triangle.fill", color: .orange, values: report.warnings)
-                    ReportSection(title: "已通过", icon: "checkmark.seal.fill", color: .green, values: report.passed)
-                    ReportSection(
-                        title: "涉及文件",
-                        icon: "doc.on.doc",
-                        color: .blue,
-                        values: report.changedPaths.isEmpty ? ["无相关文件变更"] : report.changedPaths
-                    )
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("检查结论").font(.caption.bold()).foregroundStyle(.secondary)
+                        Text(report.headline).font(.title3.bold())
+                        Text(report.plainSummary)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(17)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+
+                    CheckOverview(checks: report.display?.checks ?? [])
+                    FindingSection(title: "为什么暂时不能确认完成", icon: "exclamationmark.octagon.fill", color: .red, values: report.displayBlockers)
+                    FindingSection(title: "还有这些内容值得留意", icon: "exclamationmark.triangle.fill", color: .orange, values: report.displayWarnings)
+                    FindingSection(title: "已经确认的内容", icon: "checkmark.seal.fill", color: .green, values: report.displayPassed)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("本次检查涉及的文件", systemImage: "doc.on.doc")
+                            .font(.headline)
+                            .foregroundStyle(.blue)
+                        Text(report.display?.filesSummary ?? (report.changedPaths.isEmpty ? "本次没有发现需要验证的项目改动。" : "本次共检查 \(report.changedPaths.count) 个相关文件。"))
+                            .foregroundStyle(.secondary)
+                        ForEach(report.changedPaths, id: \.self) { path in
+                            Text(path)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
                     Text("DoneGuard 提供的是完成证据，不等同于需求正确性或完整测试覆盖。")
                         .font(.caption)
                         .foregroundStyle(.secondary)

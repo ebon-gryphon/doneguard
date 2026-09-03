@@ -1380,6 +1380,216 @@ def triggered_paths_for_rule(rule: dict[str, Any], paths: list[str]) -> list[str
     return [path for path in paths if code_changed([path])]
 
 
+MODE_LABELS = {
+    "warn": "提醒模式（只提示，不阻止任务结束）",
+    "strict": "严格模式（证据不足时会让 Codex 再检查一次）",
+    "observe": "观察模式（只记录，不弹出提醒）",
+}
+
+VERIFICATION_KIND_LABELS = {
+    "test": "测试",
+    "lint": "代码规范检查",
+    "typecheck": "类型检查",
+    "build": "构建",
+}
+
+
+def plain_finding(message: str, category: str) -> dict[str, str]:
+    """Turn stable machine evidence into a beginner-friendly Chinese explanation."""
+    finding = {
+        "title": "检查记录",
+        "detail": "DoneGuard 记录了一项需要关注的检查结果。",
+        "next_step": "如果你不确定这项内容的含义，可以把下方技术详情交给开发者查看。",
+        "technical_detail": message,
+    }
+
+    if message == "code changed, but no successful test, lint, typecheck, or build was recorded after the latest observed edit":
+        return {
+            "title": "代码改动后还没有验证",
+            "detail": "检测到代码有改动，但最后一次修改之后，没有找到成功的测试、代码规范检查、类型检查或构建记录。因此 DoneGuard 暂时无法确认这次修改已经验证。",
+            "next_step": "请运行适合该项目的测试或构建命令，然后确认命令成功结束。",
+            "technical_detail": message,
+        }
+    if message == "recorded verification evidence is stale because relevant code content changed":
+        return {
+            "title": "之前的检查结果已经过期",
+            "detail": "虽然之前运行过检查，但代码后来又发生了变化。旧结果不能说明当前代码仍然正常。",
+            "next_step": "请在最后一次代码修改之后重新运行测试或构建。",
+            "technical_detail": message,
+        }
+    if message.startswith("the latest recorded ") and " command failed: " in message:
+        match = re.match(r"the latest recorded (\w+) command failed: (.+)", message)
+        kind = VERIFICATION_KIND_LABELS.get(match.group(1), "验证") if match else "验证"
+        command = match.group(2) if match else message
+        return {
+            "title": f"{kind}没有通过",
+            "detail": f"最后一次运行的{kind}命令执行失败，所以当前任务还不能算验证完成。",
+            "next_step": "请查看命令输出，修复问题后重新运行，直到命令成功结束。",
+            "technical_detail": f"命令：{command}",
+        }
+    if message.startswith("successful verification recorded ("):
+        details = message.removeprefix("successful verification recorded (").removesuffix(")")
+        return {
+            "title": "已找到成功的验证记录",
+            "detail": "最后一次代码修改后，至少有一项测试、代码检查或构建成功完成。",
+            "next_step": "",
+            "technical_detail": "记录：" + details,
+        }
+    match = re.match(r"(\d+) changed or touched file\(s\) inspected", message)
+    if match:
+        count = match.group(1)
+        return {
+            "title": "已检查本次涉及的文件",
+            "detail": f"DoneGuard 已检查本次改动涉及的 {count} 个文件。",
+            "next_step": "",
+            "technical_detail": message,
+        }
+    if message.startswith("new debug or temporary markers found: "):
+        details = message.split(": ", 1)[1]
+        return {
+            "title": "发现可能遗留的调试内容",
+            "detail": "改动中出现了调试语句或临时标记。它们可能只是开发时留下的内容。",
+            "next_step": "请确认这些内容是否需要保留；不需要时请删除。",
+            "technical_detail": "位置：" + details,
+        }
+    if message.startswith("blocking debug markers found: "):
+        details = message.split(": ", 1)[1]
+        return {
+            "title": "发现不允许保留的调试内容",
+            "detail": "项目规则要求处理这些调试语句或临时标记后才能完成任务。",
+            "next_step": "请删除这些内容，或按项目规则明确标记为允许保留。",
+            "technical_detail": "位置：" + details,
+        }
+    if message.startswith("sensitive-looking files changed: "):
+        details = message.split(": ", 1)[1]
+        return {
+            "title": "改动涉及可能包含敏感信息的文件",
+            "detail": "本次修改碰到了名称看起来像密钥、凭据或环境配置的文件。DoneGuard 无法判断其中是否真的包含秘密信息。",
+            "next_step": "提交或分享前，请确认文件中没有密码、令牌、私钥等敏感内容。",
+            "technical_detail": "文件：" + details,
+        }
+    if message.startswith("some verification commands had an unknown exit status"):
+        return {
+            "title": "有些检查无法确认是否成功",
+            "detail": "DoneGuard 看到了验证命令，但没有取得明确的成功或失败状态，因此没有把它们算作已通过。",
+            "next_step": "请重新运行这些命令，并确认能看到明确的成功结果。",
+            "technical_detail": message,
+        }
+    if message.startswith("debug marker scan is incomplete: "):
+        return {
+            "title": "调试内容没有检查完整",
+            "detail": "部分文件未能完整扫描，所以仍可能存在没有被发现的调试语句或临时标记。",
+            "next_step": "请查看技术详情中的文件，并手动确认。",
+            "technical_detail": message.split(": ", 1)[1],
+        }
+    if message.startswith("workspace fingerprint is incomplete: "):
+        return {
+            "title": "工作区状态没有读取完整",
+            "detail": "项目较大或读取受到限制，DoneGuard 没能完整确认当前代码状态，因此验证结果的可信度会降低。",
+            "next_step": "请查看技术详情；必要时调整 fingerprint_limits 后重新检查。",
+            "technical_detail": message,
+        }
+    if message.startswith("changed code is not covered by a required verification rule: "):
+        return {
+            "title": "部分代码改动没有对应的必做检查",
+            "detail": "项目设置了必须运行的验证规则，但这些改动没有被任何规则覆盖。",
+            "next_step": "请补充或调整 .doneguard.json 中的验证覆盖范围。",
+            "technical_detail": message.split(": ", 1)[1],
+        }
+    if " coverage (" in message:
+        identifier, details = message.split(" coverage (", 1)
+        return {
+            "title": f"{identifier} 的覆盖率证据有效",
+            "detail": "DoneGuard 已读取并确认这项覆盖率结果符合项目要求。",
+            "next_step": "",
+            "technical_detail": details.removesuffix(")"),
+        }
+    if message.startswith("required verification coverage mapped for "):
+        return {
+            "title": "必做检查已覆盖本次改动",
+            "detail": "项目要求的验证规则已经覆盖到相关改动文件。",
+            "next_step": "",
+            "technical_detail": message,
+        }
+    if message.startswith("required verification "):
+        identifier = message.split()[2]
+        return {
+            "title": f"项目要求的检查 {identifier} 尚未通过",
+            "detail": "项目配置规定这项检查必须成功，但 DoneGuard 没有找到符合要求的成功记录。",
+            "next_step": f"请运行项目中标识为 {identifier} 的检查并处理失败项。",
+            "technical_detail": message,
+        }
+
+    if category == "passed":
+        finding["title"] = "检查已通过"
+        finding["detail"] = "DoneGuard 找到了支持任务完成的检查证据。"
+        finding["next_step"] = ""
+    elif category == "warning":
+        finding["title"] = "有一项内容需要留意"
+        finding["detail"] = "这项内容不会阻止任务结束，但建议在交付前确认。"
+    else:
+        finding["title"] = "有一项问题需要处理"
+        finding["detail"] = "按照当前项目规则，这项问题会影响完成判断。"
+    return finding
+
+
+def plain_language_report(report: dict[str, Any]) -> dict[str, Any]:
+    blockers = list(report.get("blockers", []))
+    warnings = list(report.get("warnings", []))
+    passed = list(report.get("passed", []))
+    paths = list(report.get("changed_paths", []))
+
+    if blockers:
+        headline = "暂时还不能确认任务已完成"
+        summary = f"发现 {len(blockers)} 个需要处理的问题。按建议处理并重新验证后，再结束任务会更稳妥。"
+    elif warnings:
+        headline = "任务已有完成证据，但还有提醒"
+        summary = f"主要验证没有发现阻断问题，同时有 {len(warnings)} 项内容建议你确认。"
+    else:
+        headline = "任务已完成检查"
+        summary = "DoneGuard 找到了与当前改动匹配的完成证据，没有发现需要阻止交付的问题。"
+
+    has_missing_verification = any(item.startswith("code changed, but no successful") for item in blockers)
+    has_failed_verification = any(item.startswith("the latest recorded ") for item in blockers)
+    debug_blocked = any("debug" in item or "temporary markers" in item for item in blockers)
+    debug_warned = any("debug" in item or "temporary markers" in item for item in warnings)
+    sensitive_blocked = any(item.startswith("sensitive-looking files changed") for item in blockers)
+    sensitive_warned = any(item.startswith("sensitive-looking files changed") for item in warnings)
+    has_success = any(item.startswith("successful verification recorded") for item in passed)
+    checks = [
+        {
+            "title": "项目改动",
+            "status": "passed" if paths else "neutral",
+            "detail": f"已找到并检查 {len(paths)} 个本次涉及的文件。" if paths else "没有发现需要验证的项目改动。",
+        },
+        {
+            "title": "测试与构建记录",
+            "status": "issue" if has_missing_verification or has_failed_verification else ("passed" if has_success else "neutral"),
+            "detail": "代码改动后还缺少成功的验证记录。" if has_missing_verification else ("最近一次验证失败。" if has_failed_verification else ("已找到最后一次修改后的成功记录。" if has_success else "本次没有代码改动，因此不要求运行测试或构建。")),
+        },
+        {
+            "title": "调试与临时内容",
+            "status": "issue" if debug_blocked else ("warning" if debug_warned else "passed"),
+            "detail": "发现了需要处理的调试语句或临时标记。" if debug_blocked else ("发现了需要确认的调试语句或临时标记。" if debug_warned else "没有发现新增的常见调试语句或临时标记。"),
+        },
+        {
+            "title": "敏感文件提示",
+            "status": "issue" if sensitive_blocked else ("warning" if sensitive_warned else "passed"),
+            "detail": "项目规则要求先确认本次涉及的敏感文件。" if sensitive_blocked else ("改动涉及名称看起来可能含有敏感信息的文件。" if sensitive_warned else "没有发现本次改动涉及常见的敏感文件名。"),
+        },
+    ]
+    return {
+        "headline": headline,
+        "summary": summary,
+        "mode_label": MODE_LABELS.get(str(report.get("mode")), str(report.get("mode") or "未知模式")),
+        "checks": checks,
+        "blockers": [plain_finding(item, "blocker") for item in blockers],
+        "warnings": [plain_finding(item, "warning") for item in warnings],
+        "passed": [plain_finding(item, "passed") for item in passed],
+        "files_summary": f"本次共检查 {len(paths)} 个相关文件。" if paths else "本次没有发现需要验证的项目改动。",
+    }
+
+
 def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     cwd = Path(str(event.get("cwd") or state.get("cwd") or os.getcwd())).resolve()
     config, config_warnings = load_config(cwd)
@@ -1518,7 +1728,7 @@ def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     if all_paths:
         passed.append(f"{len(all_paths)} changed or touched file(s) inspected")
 
-    return {
+    report = {
         "schema_version": 3,
         "checked_at": now_iso(),
         "session_id": str(event.get("session_id") or state.get("session_id") or "unknown"),
@@ -1539,6 +1749,8 @@ def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         "warnings": warnings,
         "blockers": blockers,
     }
+    report["display"] = plain_language_report(report)
+    return report
 
 
 def report_status(report: dict[str, Any]) -> str:
@@ -1572,12 +1784,34 @@ def write_text(path: Path, value: str) -> None:
 
 
 def report_html(report: dict[str, Any]) -> str:
-    def section(title: str, values: list[Any], css_class: str) -> str:
+    def finding_section(title: str, values: list[dict[str, Any]], css_class: str) -> str:
         if not values:
             return ""
-        items = "".join(f"<li>{html.escape(str(value))}</li>" for value in values)
+        items = ""
+        for value in values:
+            heading = html.escape(str(value.get("title") or "检查记录"))
+            detail = html.escape(str(value.get("detail") or ""))
+            next_step = html.escape(str(value.get("next_step") or ""))
+            technical = html.escape(str(value.get("technical_detail") or ""))
+            action_html = f'<p class="action"><strong>建议：</strong>{next_step}</p>' if next_step else ""
+            technical_html = f'<details><summary>查看技术详情</summary><code>{technical}</code></details>' if technical else ""
+            items += f"<li><strong>{heading}</strong><p>{detail}</p>{action_html}{technical_html}</li>"
         return f'<section class="{css_class}"><h2>{title}</h2><ul>{items}</ul></section>'
 
+    def checks_section(values: list[dict[str, Any]]) -> str:
+        cards = "".join(
+            '<article class="check '
+            + html.escape(str(item.get("status") or "neutral"))
+            + '"><strong>'
+            + html.escape(str(item.get("title") or "检查项目"))
+            + '</strong><p>'
+            + html.escape(str(item.get("detail") or ""))
+            + "</p></article>"
+            for item in values
+        )
+        return f'<section><h2>DoneGuard 检查了什么</h2><div class="checks">{cards}</div></section>'
+
+    display = report.get("display") or plain_language_report(report)
     title = html.escape(str(report.get("project_name") or "DoneGuard"))
     checked_at = html.escape(str(report.get("checked_at") or ""))
     changed = [html.escape(str(value)) for value in report.get("changed_paths", [])]
@@ -1590,17 +1824,21 @@ def report_html(report: dict[str, Any]) -> str:
 :root{{--ink:#18322f;--muted:#667975;--paper:#fffdf8;--green:#1f8a70;--amber:#d88718;--red:#c6533d}}
 *{{box-sizing:border-box}} body{{margin:0;background:#edf4ef;color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}}
 main{{max-width:820px;margin:40px auto;padding:34px;background:var(--paper);border:1px solid #dbe7df;border-radius:24px;box-shadow:0 18px 60px #244b3d20}}
-.eyebrow{{color:var(--green);font-weight:700;letter-spacing:.08em}} h1{{margin:.2em 0;font-size:30px}} .meta{{color:var(--muted)}}
+.eyebrow{{color:var(--green);font-weight:700;letter-spacing:.08em}} h1{{margin:.2em 0;font-size:30px}} .meta{{color:var(--muted)}} .summary{{font-size:17px;max-width:680px}}
 .pill{{display:inline-block;margin:10px 0 18px;padding:6px 12px;border-radius:99px;background:#e2f4eb;color:var(--green);font-weight:700}}
 section{{margin-top:20px;padding:18px 20px;border-radius:16px;background:#f5f7f5}} section.issue{{background:#fff0ea}} section.warning{{background:#fff6df}}
-h2{{margin:0 0 8px;font-size:17px}} ul{{margin:0;padding-left:21px}} .paths{{display:flex;flex-wrap:wrap;gap:8px}} code{{padding:4px 8px;border-radius:8px;background:#e8efeb}}
+h2{{margin:0 0 8px;font-size:17px}} ul{{margin:0;padding-left:21px}} li+li{{margin-top:16px}} li p{{margin:3px 0}} .action{{color:#314d47}} details{{margin-top:6px;color:var(--muted)}} details code{{display:block;margin-top:6px;white-space:pre-wrap}} .checks{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} .check{{padding:12px;border-radius:12px;background:#fff}} .check p{{margin:4px 0 0;color:var(--muted)}} .check.issue{{border-left:4px solid var(--red)}} .check.warning{{border-left:4px solid var(--amber)}} .check.passed{{border-left:4px solid var(--green)}} .paths{{display:flex;flex-wrap:wrap;gap:8px}} code{{padding:4px 8px;border-radius:8px;background:#e8efeb}}
 footer{{margin-top:26px;color:var(--muted);font-size:13px}}
-</style></head><body><main><div class="eyebrow">DONEGUARD COMPLETION REPORT</div><h1>{title} · {status_label}</h1>
-<div class="pill">{status_label}</div><div class="meta">检查时间 {checked_at}</div>
-{section("需要处理", list(report.get("blockers", [])), "issue")}
-{section("提醒", list(report.get("warnings", [])), "warning")}
-{section("已通过", list(report.get("passed", [])), "passed")}
-<section><h2>涉及文件</h2><div class="paths">{changed_html}</div></section>
+@media(max-width:640px){{main{{margin:0;padding:22px;border-radius:0}}.checks{{grid-template-columns:1fr}}}}
+</style></head><body><main><div class="eyebrow">DONEGUARD 完成检查报告</div><h1>{title} · {status_label}</h1>
+<div class="pill">{status_label}</div><h2>{html.escape(str(display.get("headline") or status_label))}</h2>
+<p class="summary">{html.escape(str(display.get("summary") or ""))}</p>
+<div class="meta">检查时间 {checked_at} · {html.escape(str(display.get("mode_label") or report.get("mode") or ""))}</div>
+{checks_section(list(display.get("checks", [])))}
+{finding_section("为什么暂时不能确认完成", list(display.get("blockers", [])), "issue")}
+{finding_section("还有这些内容值得留意", list(display.get("warnings", [])), "warning")}
+{finding_section("已经确认的内容", list(display.get("passed", [])), "passed")}
+<section><h2>本次检查涉及的文件</h2><div class="paths">{changed_html}</div></section>
 <footer>DoneGuard 提供的是完成证据，不等同于需求正确性或完整测试覆盖。</footer></main></body></html>"""
 
 
@@ -1626,6 +1864,8 @@ def save_report(report: dict[str, Any], enqueue: bool = True) -> Path:
     reports = plugin_data_dir() / "reports"
     reports.mkdir(parents=True, exist_ok=True)
     report = {**report, "report_id": report_identifier(report), "status": report_status(report)}
+    if not report.get("display"):
+        report["display"] = plain_language_report(report)
     save_json(reports / "latest.json", report)
     if not enqueue:
         return reports / "latest.json"
@@ -1695,15 +1935,32 @@ def finalize_report(report_id: str, keep: bool) -> Path | None:
 
 
 def format_report(report: dict[str, Any]) -> str:
-    pieces = [f"DoneGuard ({report['mode']})"]
-    if report["passed"]:
-        pieces.append("Passed: " + "; ".join(report["passed"]))
-    if report["warnings"]:
-        pieces.append("Warnings: " + "; ".join(report["warnings"]))
-    if report["blockers"]:
-        pieces.append("Needs attention: " + "; ".join(report["blockers"]))
-    if not report["changed_paths"] and not report["warnings"] and not report["blockers"]:
-        pieces.append("No relevant workspace changes detected.")
+    display = report.get("display") or plain_language_report(report)
+    pieces = [
+        "DoneGuard 完成检查",
+        f"结论：{display['headline']}",
+        str(display["summary"]),
+        f"模式：{display['mode_label']}",
+        "检查内容：" + "；".join(
+            f"{item['title']}—{item['detail']}" for item in display.get("checks", [])
+        ),
+    ]
+    for heading, key in (
+        ("需要处理", "blockers"),
+        ("提醒", "warnings"),
+        ("已确认", "passed"),
+    ):
+        findings = display.get(key, [])
+        if not findings:
+            continue
+        pieces.append(heading + "：")
+        for finding in findings:
+            line = f"- {finding['title']}：{finding['detail']}"
+            if finding.get("next_step"):
+                line += f" 建议：{finding['next_step']}"
+            if finding.get("technical_detail"):
+                line += f" 技术详情：{finding['technical_detail']}"
+            pieces.append(line)
     return "\n".join(pieces)
 
 

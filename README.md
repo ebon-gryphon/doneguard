@@ -164,7 +164,7 @@ python3 <plugin-root>/scripts/doneguard.py status --cwd <project-root>
 python3 <plugin-root>/scripts/doneguard.py status --cwd <project-root> --json
 ```
 
-报告会给出工作区 Merkle 指纹、分块数、性能指标、跨会话缓存命中、改动路径、覆盖映射、调试扫描完整性、验证证据、通过项、警告和阻断项。退出状态未知的命令和不完整指纹都不会被算作成功。
+报告首先用中文说明“检查了什么、为什么能或不能确认完成、接下来建议怎么做”。测试命令、英文原始证据、工作区 Merkle 指纹、分块数、性能指标、跨会话缓存命中、改动路径、覆盖映射和调试扫描结果仍会保留，但会放进次要的技术详情中。这样普通用户可以先看懂结论，开发者仍能追查原始判断依据。退出状态未知的命令和不完整指纹都不会被算作成功。
 
 ## macOS 水豚 Companion
 
@@ -210,7 +210,7 @@ python3 -m unittest -v tests/test_doneguard.py
 python3 -m py_compile scripts/doneguard.py
 ```
 
-当前插件包含 44 项 Python 单元测试和一项 Swift 报告删除烟雾测试；原有黑盒与端到端验证项目继续保留。测试覆盖 Companion 缺失时的安全降级、临时报告事件、明确保存与删除、过期清理、以及 strict 首次续跑不误发完成弹窗。
+当前插件包含 47 项 Python 单元测试和一项 Swift 报告删除烟雾测试；原有黑盒与端到端验证项目继续保留。测试覆盖 Companion 缺失时的安全降级、临时报告事件、明确保存与删除、中文小白解释、过期清理、以及 strict 首次续跑不误发完成弹窗。
 
 ## 当前边界
 
