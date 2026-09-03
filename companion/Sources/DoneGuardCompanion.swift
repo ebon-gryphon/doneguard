@@ -43,6 +43,21 @@ struct ReportEvent: Codable {
     }
 }
 
+enum ReportStorage {
+    static func discard(reportPath: URL, dataDirectory: URL) throws {
+        let bundle = reportPath.deletingLastPathComponent().standardizedFileURL
+        let temporaryRoot = dataDirectory
+            .appendingPathComponent("reports/temporary", isDirectory: true)
+            .standardizedFileURL.path + "/"
+        guard bundle.path.hasPrefix(temporaryRoot) else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        if FileManager.default.fileExists(atPath: bundle.path) {
+            try FileManager.default.removeItem(at: bundle)
+        }
+    }
+}
+
 @MainActor
 final class ReportStore: ObservableObject {
     @Published var report: CompletionReport?
@@ -138,12 +153,29 @@ final class ReportStore: ObservableObject {
     }
 
     func discardReport() {
-        guard let reportPath else { return }
+        let bundle = reportPath?.deletingLastPathComponent()
+        NSLog("DoneGuard discard requested for %@", bundle?.lastPathComponent ?? "missing-report")
+        report = nil
+        reportPath = nil
+        showingDetails = false
+        errorMessage = nil
+        NotificationCenter.default.post(name: .doneGuardHide, object: nil)
+
+        guard let bundle else { return }
         do {
-            try FileManager.default.removeItem(at: reportPath.deletingLastPathComponent())
-            finish()
+            try ReportStorage.discard(
+                reportPath: bundle.appendingPathComponent("report.json"),
+                dataDirectory: dataDirectory
+            )
+            NSLog("DoneGuard discarded temporary report %@", bundle.lastPathComponent)
         } catch {
-            errorMessage = "删除失败：\(error.localizedDescription)"
+            NSLog("DoneGuard could not discard temporary report: %@", error.localizedDescription)
+            let alert = NSAlert()
+            alert.messageText = "临时报告删除失败"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "知道了")
+            alert.runModal()
         }
     }
 
@@ -290,7 +322,7 @@ struct DetailView: View {
                 Color.clear.frame(width: 48, height: 1)
             }
             .padding(18)
-            .background(.thinMaterial)
+            .background(Color(nsColor: .controlBackgroundColor))
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 15) {
@@ -320,7 +352,11 @@ struct DetailView: View {
             }
 
             HStack {
-                Button("关闭且不保存", role: .destructive, action: discard)
+                Button(role: .destructive, action: discard) {
+                    Label("关闭且不保存", systemImage: "trash")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
                 Spacer()
                 Text("只有点击保存，报告才会长期保留")
                     .font(.caption)
@@ -330,9 +366,10 @@ struct DetailView: View {
                     .tint(Color(red: 0.12, green: 0.55, blue: 0.43))
             }
             .padding(18)
-            .background(.thinMaterial)
+            .background(Color(nsColor: .controlBackgroundColor))
         }
         .frame(width: 680, height: 720)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
@@ -382,7 +419,8 @@ struct ContentView: View {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = ReportStore()
-    private var panel: NSPanel?
+    private var notificationPanel: NSPanel?
+    private var detailWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let panel = NSPanel(
@@ -400,7 +438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        self.panel = panel
+        self.notificationPanel = panel
 
         NotificationCenter.default.addObserver(
             self,
@@ -422,14 +460,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         if store.report != nil || store.errorMessage != nil {
-            showCompact()
+            if CommandLine.arguments.contains("--preview-details") && store.report != nil {
+                store.showingDetails = true
+                showDetails()
+            } else {
+                showCompact()
+            }
         }
     }
 
     @objc private func showCompact() {
-        guard let panel else { return }
-        panel.styleMask.insert(.nonactivatingPanel)
+        guard let panel = notificationPanel else { return }
+        detailWindow?.orderOut(nil)
         panel.level = .floating
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
         panel.setContentSize(NSSize(width: 400, height: 168))
         let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first
         if let visible = screen?.visibleFrame {
@@ -443,20 +488,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showDetails() {
-        guard let panel else { return }
-        panel.styleMask.remove(.nonactivatingPanel)
-        panel.level = .normal
-        panel.setContentSize(NSSize(width: 680, height: 720))
-        panel.center()
+        notificationPanel?.orderOut(nil)
+        let window: NSWindow
+        if let existing = detailWindow {
+            window = existing
+        } else {
+            let created = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 680, height: 720),
+                styleMask: [.titled, .closable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            created.contentView = NSHostingView(rootView: ContentView(store: store))
+            created.titleVisibility = .hidden
+            created.titlebarAppearsTransparent = true
+            created.isMovableByWindowBackground = true
+            created.backgroundColor = .windowBackgroundColor
+            created.isOpaque = true
+            created.hasShadow = true
+            created.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+                created.standardWindowButton(kind)?.isHidden = true
+            }
+            detailWindow = created
+            window = created
+        }
+        window.setContentSize(NSSize(width: 680, height: 720))
+        window.center()
         NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
+        window.makeKeyAndOrderFront(nil)
     }
 
     @objc private func hidePanel() {
-        panel?.orderOut(nil)
+        notificationPanel?.orderOut(nil)
+        detailWindow?.orderOut(nil)
     }
 }
 
+#if !DONEGUARD_TESTING
 @main
 struct DoneGuardCompanionApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -471,3 +540,4 @@ struct DoneGuardCompanionApp: App {
         }
     }
 }
+#endif

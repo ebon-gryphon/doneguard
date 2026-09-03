@@ -28,6 +28,8 @@ cp "$PLUGIN_SOURCE/companion/Support/Info.plist" "$APP_PATH/Contents/Info.plist"
 cp "$PLUGIN_SOURCE/companion/Assets/mascot-success.png" "$APP_PATH/Contents/Resources/mascot-success.png"
 cp "$PLUGIN_SOURCE/companion/Assets/mascot-issue.png" "$APP_PATH/Contents/Resources/mascot-issue.png"
 
+pkill -x DoneGuardCompanion 2>/dev/null || true
+
 if [[ -e "$TARGET_PATH" ]]; then
   BACKUP_PATH="$DATA_DIR/DoneGuard Companion.previous.app"
   if [[ -e "$BACKUP_PATH" ]]; then

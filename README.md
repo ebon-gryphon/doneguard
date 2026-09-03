@@ -177,7 +177,7 @@ zsh /path/to/doneguard/scripts/install_companion_macos.sh
 工作流程如下。
 
 - Hook 只保留一份滚动的 `reports/latest.json`，并为待查看的报告创建临时 bundle。
-- Companion 收到最终停止事件后，在屏幕右上角显示一条非激活式通知，不会抢走当前应用焦点。水豚缩在操作按钮左侧；只有用户主动点击“查看报告”后，完整报告才会居中并取得焦点。没有安装 Companion 时仍使用聊天内提示。
+- Companion 收到最终停止事件后，在屏幕右上角显示一条非激活式通知，不会抢走当前应用焦点。水豚缩在操作按钮左侧；只有用户主动点击“查看报告”后，独立的不透明报告窗口才会居中并取得焦点。没有安装 Companion 时仍使用聊天内提示。
 - 用户打开完整报告后可以选择“保存报告”或“关闭且不保存”。保存后 bundle 进入 `reports/saved/`，不保存则立即删除。
 - 用户没有作出选择而关闭窗口时，报告仍是临时数据；默认 24 小时后由下一次检查清理。
 - Companion 不保存用户提示词，也不复制项目源文件内容。报告只包含 DoneGuard 已有的证据、路径和检查结果。
@@ -210,7 +210,7 @@ python3 -m unittest -v tests/test_doneguard.py
 python3 -m py_compile scripts/doneguard.py
 ```
 
-当前插件包含 44 项单元测试；原有黑盒与端到端验证项目继续保留。单元测试新增覆盖 Companion 缺失时的安全降级、临时报告事件、明确保存与删除、过期清理、以及 strict 首次续跑不误发完成弹窗。
+当前插件包含 44 项 Python 单元测试和一项 Swift 报告删除烟雾测试；原有黑盒与端到端验证项目继续保留。测试覆盖 Companion 缺失时的安全降级、临时报告事件、明确保存与删除、过期清理、以及 strict 首次续跑不误发完成弹窗。
 
 ## 当前边界
 
