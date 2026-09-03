@@ -15,7 +15,7 @@ Read `.doneguard.json` from the project root when it exists. The default mode is
 - `warn`: show a completion report but allow the turn to finish.
 - `strict`: ask Codex to continue once when blocking evidence is missing or failed.
 
-When the optional macOS Companion is installed, `warn` and the final `strict` stop deliver the report outside the project in a floating capybara window. If Companion cannot be launched, preserve the inline `systemMessage` fallback. Never describe the first strict continuation as task completion.
+When the optional macOS Companion is installed, `warn` and the final `strict` stop deliver the report outside the project as a compact, non-activating upper-right notification. Keep the capybara beside the actions instead of making it the main content. Only the user's explicit View Report action should open a centered, focused report window. If Companion cannot be launched, preserve the inline `systemMessage` fallback. Never describe the first strict continuation as task completion.
 
 When the user asks to change modes, create or update `.doneguard.json` while preserving unrelated fields:
 

@@ -1,6 +1,12 @@
 import AppKit
 import SwiftUI
 
+extension Notification.Name {
+    static let doneGuardShowCompact = Notification.Name("DoneGuardShowCompact")
+    static let doneGuardShowDetails = Notification.Name("DoneGuardShowDetails")
+    static let doneGuardHide = Notification.Name("DoneGuardHide")
+}
+
 struct CompletionReport: Codable, Identifiable, Equatable {
     let reportID: String
     let projectName: String
@@ -95,11 +101,22 @@ final class ReportStore: ObservableObject {
             report = decoded
             showingDetails = false
             errorMessage = nil
-            NSApp.activate(ignoringOtherApps: true)
+            NotificationCenter.default.post(name: .doneGuardShowCompact, object: nil)
         } catch {
             errorMessage = "报告暂时无法打开：\(error.localizedDescription)"
             try? FileManager.default.removeItem(at: eventURL)
+            NotificationCenter.default.post(name: .doneGuardShowCompact, object: nil)
         }
+    }
+
+    func showDetails() {
+        showingDetails = true
+        NotificationCenter.default.post(name: .doneGuardShowDetails, object: nil)
+    }
+
+    func showSummary() {
+        showingDetails = false
+        NotificationCenter.default.post(name: .doneGuardShowCompact, object: nil)
     }
 
     func saveReport() {
@@ -131,7 +148,7 @@ final class ReportStore: ObservableObject {
     }
 
     func postpone() {
-        NSApp.hide(nil)
+        NotificationCenter.default.post(name: .doneGuardHide, object: nil)
     }
 
     private func finish() {
@@ -139,26 +156,8 @@ final class ReportStore: ObservableObject {
         reportPath = nil
         showingDetails = false
         errorMessage = nil
-        NSApp.hide(nil)
+        NotificationCenter.default.post(name: .doneGuardHide, object: nil)
     }
-}
-
-struct WindowStyler: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async {
-            guard let window = view.window else { return }
-            window.level = .floating
-            window.titleVisibility = .hidden
-            window.titlebarAppearsTransparent = true
-            window.isMovableByWindowBackground = true
-            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-            window.center()
-        }
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 struct MascotImage: View {
@@ -194,12 +193,12 @@ struct SummaryView: View {
 
     private var summary: String {
         if !report.blockers.isEmpty {
-            return "DoneGuard 找到 \(report.blockers.count) 个需要处理的问题。完整报告里有证据和涉及文件。"
+            return "找到 \(report.blockers.count) 个需要处理的问题"
         }
         if !report.warnings.isEmpty {
-            return "检查已完成，同时留下 \(report.warnings.count) 项提醒，你可以打开报告再决定是否保存。"
+            return "检查完成，同时留下 \(report.warnings.count) 项提醒"
         }
-        return "没有发现阻断项。你可以查看完整证据，再决定是否保留这份报告。"
+        return "没有发现阻断项"
     }
 
     private var accent: Color {
@@ -207,49 +206,44 @@ struct SummaryView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            ZStack(alignment: .topTrailing) {
-                LinearGradient(
-                    colors: report.status == "success"
-                        ? [Color(red: 0.88, green: 0.97, blue: 0.92), Color(red: 0.97, green: 0.94, blue: 0.82)]
-                        : [Color(red: 1.00, green: 0.94, blue: 0.80), Color(red: 1.00, green: 0.88, blue: 0.82)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                MascotImage(status: report.status)
-                    .padding(.top, 8)
-                    .padding(.horizontal, 62)
-                    .padding(.bottom, 2)
-            }
-            .frame(height: 292)
-
+        HStack(spacing: 13) {
+            MascotImage(status: report.status)
+                .frame(width: 88, height: 116)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 13) {
-                Text(report.projectName.uppercased())
-                    .font(.caption.weight(.bold))
-                    .tracking(1.4)
-                    .foregroundStyle(accent)
+                HStack(spacing: 6) {
+                    Circle().fill(accent).frame(width: 7, height: 7)
+                    Text(report.projectName)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                        .foregroundStyle(.secondary)
+                }
                 Text(title)
-                    .font(.system(size: 25, weight: .bold, design: .rounded))
+                    .font(.system(size: 18, weight: .bold, design: .rounded))
                 Text(summary)
-                    .font(.system(size: 14.5))
+                    .font(.system(size: 12.5))
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(2)
 
-                HStack(spacing: 10) {
-                    Button("查看完整报告", action: showDetails)
+                HStack(spacing: 8) {
+                    Button("查看报告", action: showDetails)
                         .buttonStyle(.borderedProminent)
                         .tint(accent)
-                        .controlSize(.large)
-                    Button("稍后处理", action: postpone)
+                        .controlSize(.small)
+                    Button("稍后", action: postpone)
                         .buttonStyle(.bordered)
-                        .controlSize(.large)
+                        .controlSize(.small)
                 }
             }
-            .padding(25)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(nsColor: .windowBackgroundColor))
         }
-        .frame(width: 460)
+        .padding(14)
+        .frame(width: 400, height: 168)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.primary.opacity(0.10), lineWidth: 1)
+        }
     }
 }
 
@@ -301,7 +295,7 @@ struct DetailView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 15) {
                     HStack(spacing: 15) {
-                        MascotImage(status: report.status).frame(width: 92, height: 92)
+                        MascotImage(status: report.status).frame(width: 72, height: 72)
                         VStack(alignment: .leading, spacing: 5) {
                             Text(report.projectName).font(.title2.bold())
                             Text("检查时间  \(report.checkedAt)").font(.caption).foregroundStyle(.secondary)
@@ -352,14 +346,14 @@ struct ContentView: View {
                 if store.showingDetails {
                     DetailView(
                         report: report,
-                        back: { store.showingDetails = false },
+                        back: store.showSummary,
                         save: store.saveReport,
                         discard: store.discardReport
                     )
                 } else {
                     SummaryView(
                         report: report,
-                        showDetails: { store.showingDetails = true },
+                        showDetails: store.showDetails,
                         postpone: store.postpone
                     )
                 }
@@ -369,10 +363,10 @@ struct ContentView: View {
                     Text(store.errorMessage ?? "等待 DoneGuard 报告…")
                         .foregroundStyle(.secondary)
                 }
-                .frame(width: 360, height: 180)
+                .frame(width: 400, height: 168)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             }
         }
-        .background(WindowStyler())
         .onReceive(poller) { _ in store.poll() }
         .alert("DoneGuard", isPresented: Binding(
             get: { store.errorMessage != nil },
@@ -385,22 +379,95 @@ struct ContentView: View {
     }
 }
 
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let store = ReportStore()
+    private var panel: NSPanel?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 168),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.contentView = NSHostingView(rootView: ContentView(store: store))
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.hidesOnDeactivate = false
+        panel.isMovableByWindowBackground = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        self.panel = panel
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(showCompact),
+            name: .doneGuardShowCompact,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(showDetails),
+            name: .doneGuardShowDetails,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(hidePanel),
+            name: .doneGuardHide,
+            object: nil
+        )
+
+        if store.report != nil || store.errorMessage != nil {
+            showCompact()
+        }
+    }
+
+    @objc private func showCompact() {
+        guard let panel else { return }
+        panel.styleMask.insert(.nonactivatingPanel)
+        panel.level = .floating
+        panel.setContentSize(NSSize(width: 400, height: 168))
+        let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first
+        if let visible = screen?.visibleFrame {
+            panel.setFrameOrigin(NSPoint(
+                x: visible.maxX - panel.frame.width - 18,
+                y: visible.maxY - panel.frame.height - 18
+            ))
+        }
+        NSApp.unhideWithoutActivation()
+        panel.orderFrontRegardless()
+    }
+
+    @objc private func showDetails() {
+        guard let panel else { return }
+        panel.styleMask.remove(.nonactivatingPanel)
+        panel.level = .normal
+        panel.setContentSize(NSSize(width: 680, height: 720))
+        panel.center()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func hidePanel() {
+        panel?.orderOut(nil)
+    }
+}
+
 @main
 struct DoneGuardCompanionApp: App {
-    @StateObject private var store = ReportStore()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
         NSApplication.shared.setActivationPolicy(.accessory)
     }
 
     var body: some Scene {
-        WindowGroup {
-            ContentView(store: store)
-        }
-        .windowStyle(.hiddenTitleBar)
-        .windowResizability(.contentSize)
-        .commands {
-            CommandGroup(replacing: .newItem) {}
+        Settings {
+            EmptyView()
         }
     }
 }
