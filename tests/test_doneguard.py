@@ -161,6 +161,71 @@ class DoneGuardTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIsNotNone(doneguard.latest_report(self.repo))
 
+    def test_without_companion_keeps_inline_fallback_and_only_latest_report(self) -> None:
+        self.start_and_edit()
+        result = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
+        self.assertIn("systemMessage", result)
+        self.assertTrue((self.data / "reports" / "latest.json").exists())
+        self.assertFalse((self.data / "reports" / "temporary").exists())
+
+    def test_companion_receives_temporary_report_and_suppresses_inline_message(self) -> None:
+        (self.data / "DoneGuard Companion.app").mkdir()
+        self.start_and_edit()
+        with mock.patch.object(doneguard, "launch_companion", return_value=True):
+            result = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
+        self.assertIsNone(result)
+        report = doneguard.latest_report(self.repo)
+        report_id = report["report_id"]
+        bundle = self.data / "reports" / "temporary" / report_id
+        self.assertTrue((bundle / "report.json").exists())
+        self.assertTrue((bundle / "report.html").exists())
+        self.assertTrue((self.data / "events" / f"{report_id}.json").exists())
+        self.assertEqual(report["status"], "issue")
+
+    def test_strict_first_block_does_not_emit_completion_popup(self) -> None:
+        (self.repo / ".doneguard.json").write_text('{"mode":"strict"}\n', encoding="utf-8")
+        (self.data / "DoneGuard Companion.app").mkdir()
+        self.start_and_edit()
+        first = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
+        self.assertEqual(first.get("decision"), "block")
+        self.assertFalse((self.data / "events").exists())
+        with mock.patch.object(doneguard, "launch_companion", return_value=True):
+            second = doneguard.handle_hook(self.event("Stop", stop_hook_active=True))
+        self.assertIsNone(second)
+        self.assertEqual(len(list((self.data / "events").glob("*.json"))), 1)
+
+    def test_report_can_be_saved_or_discarded_after_viewing(self) -> None:
+        (self.data / "DoneGuard Companion.app").mkdir()
+        self.start_and_edit()
+        with mock.patch.object(doneguard, "launch_companion", return_value=True):
+            doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
+        first = doneguard.latest_report(self.repo)
+        saved = doneguard.finalize_report(first["report_id"], keep=True)
+        self.assertTrue((saved / "report.json").exists())
+        self.assertFalse((self.data / "reports" / "temporary" / first["report_id"]).exists())
+
+        (self.repo / "app.py").write_text("def value():\n    return 3\n", encoding="utf-8")
+        with mock.patch.object(doneguard, "launch_companion", return_value=True):
+            doneguard.handle_hook(self.event("Stop", stop_hook_active=True))
+        second = doneguard.latest_report(self.repo)
+        temporary = self.data / "reports" / "temporary" / second["report_id"]
+        self.assertTrue(temporary.exists())
+        self.assertIsNone(doneguard.finalize_report(second["report_id"], keep=False))
+        self.assertFalse(temporary.exists())
+
+    def test_expired_temporary_report_and_event_are_cleaned_together(self) -> None:
+        (self.data / "DoneGuard Companion.app").mkdir()
+        self.start_and_edit()
+        with mock.patch.object(doneguard, "launch_companion", return_value=True):
+            doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
+        report = doneguard.latest_report(self.repo)
+        bundle = self.data / "reports" / "temporary" / report["report_id"]
+        event = self.data / "events" / f"{report['report_id']}.json"
+        os.utime(bundle, (0, 0))
+        doneguard.cleanup_temporary_reports(1)
+        self.assertFalse(bundle.exists())
+        self.assertFalse(event.exists())
+
     def test_bash_edit_makes_previous_verification_stale(self) -> None:
         self.start_and_edit()
         doneguard.handle_hook(self.event(

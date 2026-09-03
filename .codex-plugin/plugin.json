@@ -1,15 +1,15 @@
 {
   "name": "doneguard",
-  "version": "0.1.0+codex.20260903060527",
-  "description": "Verify that Codex has evidence for completion before a coding task ends.",
+  "version": "0.1.0+codex.20260903122403",
+  "description": "Verify completion evidence and optionally show it in a macOS capybara companion.",
   "author": {
     "name": "DoneGuard"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "DoneGuard",
-    "shortDescription": "Check completion evidence before Codex stops.",
-    "longDescription": "DoneGuard maps code and declared non-code inputs to structured verification rules, validates fresh artifacts, records language-aware scan completeness, and uses budgeted persistent Merkle fingerprints before Codex finishes.",
+    "shortDescription": "Completion evidence with an optional capybara popup.",
+    "longDescription": "DoneGuard maps code and declared non-code inputs to structured verification rules, validates fresh artifacts, and uses Merkle fingerprints before Codex finishes. Its optional macOS Companion shows reports outside the project and only keeps them when the user chooses Save.",
     "developerName": "DoneGuard",
     "category": "Productivity",
     "capabilities": [

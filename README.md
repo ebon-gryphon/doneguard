@@ -1,6 +1,6 @@
 # DoneGuard
 
-DoneGuard 是一个面向 Codex 的本地完成检查插件。它会观察代码改动和验证命令，在任务结束前检查当前工作区是否具备足够的新鲜验证证据。
+DoneGuard 是一个面向 Codex 的本地完成检查插件。它会观察代码改动和验证命令，在任务结束前检查当前工作区是否具备足够的新鲜验证证据。可选的 macOS Companion 会在项目外显示一张带二次元水豚的完成卡片，并在用户查看完整报告后再询问是否保存。
 
 当前版本适用于 Git 仓库。默认模式为 `warn`，它会展示报告，但不会阻止任务结束。
 
@@ -21,8 +21,8 @@ DoneGuard 提供的是完成证据。报告通过说明插件观察到的相关�
 
 | 模式 | 行为 |
 | --- | --- |
-| `observe` | 保存报告，不在对话中提示 |
-| `warn` | 展示报告，允许任务结束 |
+| `observe` | 更新滚动状态，不弹窗也不打断对话 |
+| `warn` | Companion 已安装时弹窗，否则在对话中提示；允许任务结束 |
 | `strict` | 缺少阻断证据时请求 Codex 继续一次 |
 
 `strict` 每个停止周期最多自动续跑一次，避免检查进入循环。
@@ -43,6 +43,9 @@ DoneGuard 提供的是完成证据。报告通过说明插件观察到的相关�
 {
   "schema_version": 3,
   "mode": "strict",
+  "companion_enabled": true,
+  "notification_policy": "always",
+  "temporary_report_ttl_hours": 24,
   "require_verification_when_code_changed": true,
   "block_on_failed_verification": true,
   "block_on_debug_markers": false,
@@ -69,6 +72,8 @@ DoneGuard 提供的是完成证据。报告通过说明插件观察到的相关�
   "verification_commands": []
 }
 ```
+
+`notification_policy` 支持 `always`、`issues_only` 和 `never`。`always` 会在最终停止时显示成功或异常卡片；`issues_only` 只在有提醒或阻断项时显示。`strict` 第一次要求 Codex 继续时不会发出“任务完成”弹窗，只有最终停止才会交给 Companion。
 
 不要在没有评估误报风险时开启新的阻断项。调试标记和敏感文件默认只产生警告。
 
@@ -161,12 +166,36 @@ python3 <plugin-root>/scripts/doneguard.py status --cwd <project-root> --json
 
 报告会给出工作区 Merkle 指纹、分块数、性能指标、跨会话缓存命中、改动路径、覆盖映射、调试扫描完整性、验证证据、通过项、警告和阻断项。退出状态未知的命令和不完整指纹都不会被算作成功。
 
+## macOS 水豚 Companion
+
+Companion 是独立于项目目录的轻量 SwiftUI 应用。源码安装会在 DoneGuard 的插件数据目录中构建 `DoneGuard Companion.app`，不会向用户的代码仓库写入报告文件。
+
+```bash
+zsh /path/to/doneguard/scripts/install_companion_macos.sh
+```
+
+工作流程如下。
+
+- Hook 只保留一份滚动的 `reports/latest.json`，并为待查看的报告创建临时 bundle。
+- Companion 收到最终停止事件后显示完成或异常水豚卡片；没有安装 Companion 时仍使用聊天内提示。
+- 用户打开完整报告后可以选择“保存报告”或“关闭且不保存”。保存后 bundle 进入 `reports/saved/`，不保存则立即删除。
+- 用户没有作出选择而关闭窗口时，报告仍是临时数据；默认 24 小时后由下一次检查清理。
+- Companion 不保存用户提示词，也不复制项目源文件内容。报告只包含 DoneGuard 已有的证据、路径和检查结果。
+
+需要脚本化管理临时报告时可以使用下面的命令。
+
+```bash
+python3 /path/to/doneguard/scripts/doneguard.py report-action save <report-id>
+python3 /path/to/doneguard/scripts/doneguard.py report-action discard <report-id>
+```
+
 ## 安装和更新
 
 DoneGuard 当前通过个人 marketplace 安装。
 
 ```bash
 codex plugin add doneguard@personal
+zsh /path/to/doneguard/scripts/install_companion_macos.sh
 ```
 
 更新插件后请新建 Codex 任务，让新任务加载新的 skill 和 hook。
@@ -181,7 +210,7 @@ python3 -m unittest -v tests/test_doneguard.py
 python3 -m py_compile scripts/doneguard.py
 ```
 
-本次更新包含 39 项插件单元测试、25 项通用黑盒验收测试，以及冷链 Node.js 项目的 8 项端到端测试。测试覆盖 Schema 3 非代码触发、结构化命令与目录约束、覆盖率产物、语言感知调试扫描、扫描完整性、Merkle 指纹预算、401 文件批处理、跨会话缓存、嵌套测试自动发现和空测试集拒绝通过。
+当前插件包含 44 项单元测试；原有黑盒与端到端验证项目继续保留。单元测试新增覆盖 Companion 缺失时的安全降级、临时报告事件、明确保存与删除、过期清理、以及 strict 首次续跑不误发完成弹窗。
 
 ## 当前边界
 
@@ -190,3 +219,5 @@ python3 -m py_compile scripts/doneguard.py
 - Schema 3 的必需规则必须使用结构化 `argv`。内置命令和旧版启发式选择器只作为兼容与便捷识别，不应承担高可信阻断判断。
 - Merkle 指纹支持 Git 批量哈希和跨会话缓存；预算超限仍会显式产生不完整证据并拒绝通过，大型仓库应根据指标调整规则分片与预算。
 - 通过报告仍然取决于项目测试本身的质量。
+- Companion MVP 目前只支持 macOS 13 及以上版本，使用本机 Swift 编译；应用没有 Developer ID 签名，不适合作为公开下载包直接分发。
+- 当前视觉先覆盖“完成”和“发现问题”两种主状态，warning 暂时复用异常水豚；后续可以继续扩展过期、等待和离线状态。

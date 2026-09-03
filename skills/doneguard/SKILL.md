@@ -15,6 +15,8 @@ Read `.doneguard.json` from the project root when it exists. The default mode is
 - `warn`: show a completion report but allow the turn to finish.
 - `strict`: ask Codex to continue once when blocking evidence is missing or failed.
 
+When the optional macOS Companion is installed, `warn` and the final `strict` stop deliver the report outside the project in a floating capybara window. If Companion cannot be launched, preserve the inline `systemMessage` fallback. Never describe the first strict continuation as task completion.
+
 When the user asks to change modes, create or update `.doneguard.json` while preserving unrelated fields:
 
 ```json
@@ -34,6 +36,9 @@ Supported optional fields are:
 - `verification_commands` (array of custom command recognizers)
 - `debug_markers` (object containing `block`, `warn`, `ignore_paths`, and `allow_comment`)
 - `fingerprint_limits` (object containing positive `max_files`, `max_total_bytes`, and `timeout_ms` budgets)
+- `companion_enabled` (boolean, default `true`)
+- `notification_policy` (`always`, `issues_only`, or `never`)
+- `temporary_report_ttl_hours` (positive integer, default `24`)
 
 Schema 3 custom verification rules have a `kind` of `test`, `lint`, `typecheck`, or `build`. Required rules should use a structured `argv` selector plus an optional repository-relative `cwd`. `when_changed` selects changes that require the rule, while `fingerprint_paths` adds non-code inputs that invalidate existing evidence:
 
@@ -69,11 +74,13 @@ Fingerprint reports use a Merkle root and include chunk counts, file counts, byt
 
 Do not enable a blocking option unless the user requests it. Explain that strict mode performs at most one automatic continuation per stop cycle to avoid loops.
 
+User-facing report bundles stay under `PLUGIN_DATA/reports/temporary` until the user explicitly saves or discards them. Saved reports move to `PLUGIN_DATA/reports/saved`; unopened temporary reports expire on a later check after the configured TTL. The rolling `reports/latest.json` is operational state, not a user-saved history. Do not claim a report was saved unless the user chose Save.
+
 ## Interpreting reports
 
 Treat DoneGuard findings as completion evidence, not proof of correctness. A passing report means relevant recorded checks succeeded after the most recent observed edit. It does not replace code review or guarantee that tests cover the requested behavior.
 
-If the user asks for the latest saved report, locate the plugin's `scripts/doneguard.py` from this skill directory and run:
+If the user asks for the latest report, locate the plugin's `scripts/doneguard.py` from this skill directory and run:
 
 ```text
 python3 <plugin-root>/scripts/doneguard.py status --cwd <project-root>

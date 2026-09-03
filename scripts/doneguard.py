@@ -14,11 +14,13 @@ from contextlib import contextmanager
 import datetime as dt
 import fnmatch
 import hashlib
+import html
 import io
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -30,6 +32,9 @@ from typing import Any, Iterator
 DEFAULT_CONFIG: dict[str, Any] = {
     "schema_version": 3,
     "mode": "warn",
+    "companion_enabled": True,
+    "notification_policy": "always",
+    "temporary_report_ttl_hours": 24,
     "require_verification_when_code_changed": True,
     "block_on_failed_verification": True,
     "block_on_debug_markers": False,
@@ -97,6 +102,7 @@ VERIFY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 BOOLEAN_CONFIG_FIELDS = {
+    "companion_enabled",
     "require_verification_when_code_changed",
     "block_on_failed_verification",
     "block_on_debug_markers",
@@ -126,11 +132,12 @@ def now_iso() -> str:
 
 
 def plugin_data_dir() -> Path:
-    raw = os.environ.get("PLUGIN_DATA")
+    raw = os.environ.get("PLUGIN_DATA") or os.environ.get("DONEGUARD_DATA")
     if raw:
         path = Path(raw)
     else:
-        path = Path.home() / ".codex" / "doneguard-data"
+        installed = Path.home() / ".codex" / "plugins" / "data" / "doneguard-personal"
+        path = installed if installed.exists() else Path.home() / ".codex" / "doneguard-data"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -240,6 +247,13 @@ def load_config(cwd: Path) -> tuple[dict[str, Any], list[str]]:
     if config.get("mode") not in {"observe", "warn", "strict"}:
         warnings.append("Unknown DoneGuard mode; using warn.")
         config["mode"] = "warn"
+    if config.get("notification_policy") not in {"always", "issues_only", "never"}:
+        warnings.append("notification_policy must be always, issues_only, or never; using always.")
+        config["notification_policy"] = "always"
+    ttl = config.get("temporary_report_ttl_hours")
+    if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl <= 0:
+        warnings.append("temporary_report_ttl_hours must be a positive integer; the default was used.")
+        config["temporary_report_ttl_hours"] = DEFAULT_CONFIG["temporary_report_ttl_hours"]
 
     for field in BOOLEAN_CONFIG_FIELDS:
         if not isinstance(config.get(field), bool):
@@ -1508,8 +1522,13 @@ def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         "schema_version": 3,
         "checked_at": now_iso(),
         "session_id": str(event.get("session_id") or state.get("session_id") or "unknown"),
+        "turn_id": str(event.get("turn_id") or "unknown"),
         "cwd": str(cwd),
+        "project_name": cwd.name or str(cwd),
         "mode": config["mode"],
+        "companion_enabled": config["companion_enabled"],
+        "notification_policy": config["notification_policy"],
+        "temporary_report_ttl_hours": config["temporary_report_ttl_hours"],
         "workspace_fingerprint": current_fingerprint,
         "fingerprint_metrics": fingerprint["metrics"],
         "changed_paths": all_paths,
@@ -1522,15 +1541,157 @@ def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def save_report(report: dict[str, Any]) -> Path:
+def report_status(report: dict[str, Any]) -> str:
+    if report.get("blockers"):
+        return "issue"
+    if report.get("warnings"):
+        return "warning"
+    return "success"
+
+
+def report_identifier(report: dict[str, Any]) -> str:
+    identity = json.dumps({
+        "session_id": report.get("session_id"),
+        "turn_id": report.get("turn_id"),
+        "workspace_fingerprint": report.get("workspace_fingerprint"),
+        "passed": report.get("passed"),
+        "warnings": report.get("warnings"),
+        "blockers": report.get("blockers"),
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()[:16]
+    session = safe_id(str(report.get("session_id") or "unknown"))[:48]
+    turn = safe_id(str(report.get("turn_id") or "unknown"))[:48]
+    return f"{session}-{turn}-{digest}"
+
+
+def write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    temp.write_text(value, encoding="utf-8")
+    temp.replace(path)
+
+
+def report_html(report: dict[str, Any]) -> str:
+    def section(title: str, values: list[Any], css_class: str) -> str:
+        if not values:
+            return ""
+        items = "".join(f"<li>{html.escape(str(value))}</li>" for value in values)
+        return f'<section class="{css_class}"><h2>{title}</h2><ul>{items}</ul></section>'
+
+    title = html.escape(str(report.get("project_name") or "DoneGuard"))
+    checked_at = html.escape(str(report.get("checked_at") or ""))
+    changed = [html.escape(str(value)) for value in report.get("changed_paths", [])]
+    changed_html = "".join(f"<code>{value}</code>" for value in changed) or "<span>无相关文件变更</span>"
+    status = report_status(report)
+    status_label = {"success": "检查完成", "warning": "存在提醒", "issue": "需要处理"}[status]
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DoneGuard · {title}</title><style>
+:root{{--ink:#18322f;--muted:#667975;--paper:#fffdf8;--green:#1f8a70;--amber:#d88718;--red:#c6533d}}
+*{{box-sizing:border-box}} body{{margin:0;background:#edf4ef;color:var(--ink);font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}}
+main{{max-width:820px;margin:40px auto;padding:34px;background:var(--paper);border:1px solid #dbe7df;border-radius:24px;box-shadow:0 18px 60px #244b3d20}}
+.eyebrow{{color:var(--green);font-weight:700;letter-spacing:.08em}} h1{{margin:.2em 0;font-size:30px}} .meta{{color:var(--muted)}}
+.pill{{display:inline-block;margin:10px 0 18px;padding:6px 12px;border-radius:99px;background:#e2f4eb;color:var(--green);font-weight:700}}
+section{{margin-top:20px;padding:18px 20px;border-radius:16px;background:#f5f7f5}} section.issue{{background:#fff0ea}} section.warning{{background:#fff6df}}
+h2{{margin:0 0 8px;font-size:17px}} ul{{margin:0;padding-left:21px}} .paths{{display:flex;flex-wrap:wrap;gap:8px}} code{{padding:4px 8px;border-radius:8px;background:#e8efeb}}
+footer{{margin-top:26px;color:var(--muted);font-size:13px}}
+</style></head><body><main><div class="eyebrow">DONEGUARD COMPLETION REPORT</div><h1>{title} · {status_label}</h1>
+<div class="pill">{status_label}</div><div class="meta">检查时间 {checked_at}</div>
+{section("需要处理", list(report.get("blockers", [])), "issue")}
+{section("提醒", list(report.get("warnings", [])), "warning")}
+{section("已通过", list(report.get("passed", [])), "passed")}
+<section><h2>涉及文件</h2><div class="paths">{changed_html}</div></section>
+<footer>DoneGuard 提供的是完成证据，不等同于需求正确性或完整测试覆盖。</footer></main></body></html>"""
+
+
+def cleanup_temporary_reports(ttl_hours: int) -> None:
+    temporary = plugin_data_dir() / "reports" / "temporary"
+    if not temporary.exists():
+        return
+    cutoff = time.time() - ttl_hours * 3600
+    for path in temporary.iterdir():
+        try:
+            if path.is_dir() and path.stat().st_mtime < cutoff:
+                report_id = path.name
+                shutil.rmtree(path)
+                try:
+                    (plugin_data_dir() / "events" / f"{report_id}.json").unlink()
+                except FileNotFoundError:
+                    pass
+        except OSError:
+            continue
+
+
+def save_report(report: dict[str, Any], enqueue: bool = True) -> Path:
     reports = plugin_data_dir() / "reports"
     reports.mkdir(parents=True, exist_ok=True)
-    session = safe_id(str(report.get("session_id") or "unknown"))
-    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    path = reports / f"{timestamp}-{session}.json"
-    save_json(path, report)
+    report = {**report, "report_id": report_identifier(report), "status": report_status(report)}
     save_json(reports / "latest.json", report)
-    return path
+    if not enqueue:
+        return reports / "latest.json"
+
+    cleanup_temporary_reports(int(report.get("temporary_report_ttl_hours") or 24))
+    bundle = reports / "temporary" / str(report["report_id"])
+    report_path = bundle / "report.json"
+    html_path = bundle / "report.html"
+    save_json(report_path, report)
+    write_text(html_path, report_html(report))
+    save_json(plugin_data_dir() / "events" / f"{report['report_id']}.json", {
+        "schema_version": 1,
+        "report_id": report["report_id"],
+        "status": report["status"],
+        "project_name": report.get("project_name"),
+        "checked_at": report.get("checked_at"),
+        "report_path": str(report_path),
+        "html_path": str(html_path),
+    })
+    return report_path
+
+
+def companion_app_path() -> Path:
+    return plugin_data_dir() / "DoneGuard Companion.app"
+
+
+def launch_companion() -> bool:
+    app = companion_app_path()
+    if sys.platform != "darwin" or not app.exists():
+        return False
+    try:
+        completed = subprocess.run(
+            ["open", "-gj", str(app), "--args", "--data-dir", str(plugin_data_dir())],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        return completed.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def finalize_report(report_id: str, keep: bool) -> Path | None:
+    identifier = safe_id(report_id)
+    if identifier != report_id:
+        raise ValueError("invalid report id")
+    data = plugin_data_dir()
+    source = data / "reports" / "temporary" / identifier
+    event = data / "events" / f"{identifier}.json"
+    try:
+        event.unlink()
+    except FileNotFoundError:
+        pass
+    if not source.exists():
+        return None
+    if not keep:
+        shutil.rmtree(source)
+        return None
+    destination = data / "reports" / "saved" / identifier
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        return destination
+    source.replace(destination)
+    return destination
 
 
 def format_report(report: dict[str, Any]) -> str:
@@ -1612,18 +1773,37 @@ def _handle_hook_locked(event: dict[str, Any]) -> dict[str, Any] | None:
     if hook_name == "Stop":
         save_json(path, state)
         report = evaluate(event, state)
-        save_report(report)
-        if not report["changed_paths"] and not report["warnings"] and not report["blockers"]:
-            return None
         message = format_report(report)
         mode = report["mode"]
+        strict_continuation = (
+            mode == "strict"
+            and bool(report["blockers"])
+            and not bool(event.get("stop_hook_active"))
+        )
+        policy = report.get("notification_policy", "always")
+        has_issue = bool(report["warnings"] or report["blockers"])
+        wants_popup = (
+            bool(report.get("companion_enabled"))
+            and mode != "observe"
+            and policy != "never"
+            and (policy == "always" or has_issue)
+            and not strict_continuation
+        )
+        companion_available = companion_app_path().exists()
+        save_report(report, enqueue=wants_popup and companion_available)
+        delivered_to_companion = wants_popup and companion_available and launch_companion()
+
         if mode == "observe":
             return None
-        if mode == "strict" and report["blockers"] and not bool(event.get("stop_hook_active")):
+        if strict_continuation:
             return {
                 "decision": "block",
                 "reason": message + "\nBefore finishing, address the blocking evidence or explain why it cannot be produced."
             }
+        if delivered_to_companion:
+            return None
+        if not report["changed_paths"] and not report["warnings"] and not report["blockers"]:
+            return None
         return {"systemMessage": message}
 
     if hook_name == "SessionEnd":
@@ -1650,10 +1830,17 @@ def latest_report(cwd: Path | None) -> dict[str, Any] | None:
     reports = plugin_data_dir() / "reports"
     if not reports.exists():
         return None
-    candidates = sorted(reports.glob("*.json"), reverse=True)
+    latest = load_json(reports / "latest.json", None)
+    if isinstance(latest, dict):
+        if cwd is None or Path(str(latest.get("cwd", ""))).resolve() == cwd.resolve():
+            return latest
+    candidates = sorted(
+        list((reports / "saved").glob("*/report.json"))
+        + list((reports / "temporary").glob("*/report.json")),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
     for path in candidates:
-        if path.name == "latest.json":
-            continue
         report = load_json(path, None)
         if not isinstance(report, dict):
             continue
@@ -1669,6 +1856,9 @@ def main() -> int:
     status_parser = subparsers.add_parser("status", help="Show the latest saved report")
     status_parser.add_argument("--cwd", type=Path)
     status_parser.add_argument("--json", action="store_true", dest="as_json")
+    action_parser = subparsers.add_parser("report-action", help="Save or discard a temporary report")
+    action_parser.add_argument("action", choices=("save", "discard"))
+    action_parser.add_argument("report_id")
     args = parser.parse_args()
 
     if args.command == "hook":
@@ -1680,6 +1870,19 @@ def main() -> int:
         result = handle_hook(event)
         if result is not None:
             print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command == "report-action":
+        try:
+            destination = finalize_report(args.report_id, keep=args.action == "save")
+        except ValueError as exc:
+            print(f"DoneGuard could not update the report: {exc}", file=sys.stderr)
+            return 2
+        if args.action == "save":
+            if destination is None:
+                print("DoneGuard could not find that temporary report.", file=sys.stderr)
+                return 1
+            print(destination)
         return 0
 
     report = latest_report(args.cwd)
