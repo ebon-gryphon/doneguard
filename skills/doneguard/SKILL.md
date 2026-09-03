@@ -1,0 +1,84 @@
+---
+name: doneguard
+description: Configure or explain DoneGuard completion checks for Codex. Use when the user mentions DoneGuard, asks whether Codex actually finished, wants a completion-evidence report, or wants to change DoneGuard modes. Do not invoke for ordinary code review requests.
+---
+
+# DoneGuard
+
+DoneGuard is a local, Git-aware completion guard. Its hooks record supported verification commands and inspect the working tree before Codex stops. Successful verification is tied to a fingerprint of the relevant changed code, so later edits invalidate older evidence regardless of which editing tool produced them.
+
+## Modes
+
+Read `.doneguard.json` from the project root when it exists. The default mode is `warn`.
+
+- `observe`: save reports without interrupting the chat.
+- `warn`: show a completion report but allow the turn to finish.
+- `strict`: ask Codex to continue once when blocking evidence is missing or failed.
+
+When the user asks to change modes, create or update `.doneguard.json` while preserving unrelated fields:
+
+```json
+{
+  "mode": "strict"
+}
+```
+
+Supported optional fields are:
+
+- `require_verification_when_code_changed` (boolean, default `true`)
+- `block_on_failed_verification` (boolean, default `true`)
+- `block_on_debug_markers` (boolean, default `false`)
+- `block_on_sensitive_files` (boolean, default `false`)
+- `ignore_paths` (array of repository-relative path prefixes)
+- `debug_marker_ignore_paths` (array of repository-relative path prefixes)
+- `verification_commands` (array of custom command recognizers)
+- `debug_markers` (object containing `block`, `warn`, `ignore_paths`, and `allow_comment`)
+- `fingerprint_limits` (object containing positive `max_files`, `max_total_bytes`, and `timeout_ms` budgets)
+
+Schema 3 custom verification rules have a `kind` of `test`, `lint`, `typecheck`, or `build`. Required rules should use a structured `argv` selector plus an optional repository-relative `cwd`. `when_changed` selects changes that require the rule, while `fingerprint_paths` adds non-code inputs that invalidate existing evidence:
+
+```json
+{
+  "verification_commands": [
+    {
+      "id": "unit-tests",
+      "kind": "test",
+      "argv": ["make", "test"],
+      "cwd": ".",
+      "required": true,
+      "when_changed": ["src/**", "test/**", "package.json", "README.md"],
+      "fingerprint_paths": ["src/**", "test/**", "package.json", "README.md"],
+      "artifacts": [
+        {
+          "path": "coverage/coverage-summary.json",
+          "format": "coverage-summary",
+          "thresholds": {"lines": 80, "branches": 75},
+          "max_age_seconds": 120
+        }
+      ]
+    }
+  ]
+}
+```
+
+DoneGuard only recognizes commands that Codex already ran; it does not execute configured commands. Schema 3 structured rules reject compound commands, redirections, command substitutions, and working-directory mismatches instead of falling back to heuristic evidence. Schema 1 and 2 `command`, `command_prefix`, `pattern`, and `covers` fields remain compatible, but a required Schema 3 rule using one of those heuristic selectors is reported as unsafe.
+
+Rules can validate `coverage-summary` or `istanbul-summary` JSON artifacts. For repeated runs of the same rule, only the newest result for the current workspace fingerprint determines its status. A line containing the configured `allow_comment` value is exempt from debug-marker reporting. Debug scan reports identify the language engine and whether scanning completed; an incomplete scan must remain visible as a warning.
+
+Fingerprint reports use a Merkle root and include chunk counts, file counts, bytes hashed, persistent cache hits, duration, completeness, and any budget limit reached. Cache entries are stored per repository under `PLUGIN_DATA`. An incomplete fingerprint is never accepted as fresh verification evidence.
+
+Do not enable a blocking option unless the user requests it. Explain that strict mode performs at most one automatic continuation per stop cycle to avoid loops.
+
+## Interpreting reports
+
+Treat DoneGuard findings as completion evidence, not proof of correctness. A passing report means relevant recorded checks succeeded after the most recent observed edit. It does not replace code review or guarantee that tests cover the requested behavior.
+
+If the user asks for the latest saved report, locate the plugin's `scripts/doneguard.py` from this skill directory and run:
+
+```text
+python3 <plugin-root>/scripts/doneguard.py status --cwd <project-root>
+```
+
+Add `--json` when a machine-readable report is needed.
+
+Summarize the result in plain language. Do not claim that a command ran if DoneGuard recorded an unknown exit status.
