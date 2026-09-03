@@ -1,0 +1,21 @@
+{
+  "name": "doneguard",
+  "version": "0.1.0+codex.20260903060527",
+  "description": "Verify that Codex has evidence for completion before a coding task ends.",
+  "author": {
+    "name": "DoneGuard"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "DoneGuard",
+    "shortDescription": "Check completion evidence before Codex stops.",
+    "longDescription": "DoneGuard maps code and declared non-code inputs to structured verification rules, validates fresh artifacts, records language-aware scan completeness, and uses budgeted persistent Merkle fingerprints before Codex finishes.",
+    "developerName": "DoneGuard",
+    "category": "Productivity",
+    "capabilities": [
+      "Skills",
+      "Hooks"
+    ],
+    "defaultPrompt": "Show me how DoneGuard is configured for this project and explain its latest completion check."
+  }
+}
