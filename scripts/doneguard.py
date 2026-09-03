@@ -1,0 +1,1694 @@
+#!/usr/bin/env python3
+"""DoneGuard hook runner.
+
+Uses only the Python standard library. Hook state and reports live under
+PLUGIN_DATA so the guarded repository stays clean unless a user explicitly
+adds a .doneguard.json configuration file.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from contextlib import contextmanager
+import datetime as dt
+import fnmatch
+import hashlib
+import io
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import tokenize
+from pathlib import Path
+from typing import Any, Iterator
+
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "schema_version": 3,
+    "mode": "warn",
+    "require_verification_when_code_changed": True,
+    "block_on_failed_verification": True,
+    "block_on_debug_markers": False,
+    "block_on_sensitive_files": False,
+    "debug_marker_ignore_paths": [],
+    "debug_markers": {
+        "block": [],
+        "warn": [
+            "TODO/FIXME/HACK",
+            "console.log",
+            "debugger",
+            "Python breakpoint",
+            "Ruby binding.pry",
+        ],
+        "ignore_paths": [],
+        "allow_comment": "doneguard: allow-debug",
+    },
+    "fingerprint_limits": {
+        "max_files": 10000,
+        "max_total_bytes": 536870912,
+        "timeout_ms": 3000,
+    },
+    "verification_commands": [],
+    "ignore_paths": [
+        ".git/",
+        ".doneguard/",
+        "dist/",
+        "build/",
+        "coverage/",
+        "vendor/",
+        "node_modules/",
+    ],
+}
+
+CODE_EXTENSIONS = {
+    ".c", ".cc", ".cpp", ".cs", ".css", ".dart", ".ex", ".exs", ".go",
+    ".html", ".java", ".js", ".jsx", ".kt", ".kts", ".lua", ".m", ".mm",
+    ".php", ".py", ".rb", ".rs", ".scala", ".scss", ".sh", ".sql", ".swift",
+    ".ts", ".tsx", ".vue", ".zig",
+}
+
+CODE_FILENAMES = {
+    "Dockerfile", "Makefile", "Package.swift", "Podfile", "build.gradle",
+    "build.gradle.kts", "go.mod", "pom.xml", "pyproject.toml", "package.json",
+    "requirements.txt", "Cargo.toml",
+}
+
+VERIFY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("test", re.compile(r"(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test(?:\s|$)")),
+    ("test", re.compile(r"(?:^|[;&|]\s*)(?:pytest|python(?:3)?\s+-m\s+pytest|vitest|jest|rspec|phpunit)(?:\s|$)")),
+    ("test", re.compile(r"(?:^|[;&|]\s*)python(?:3)?\s+-m\s+unittest(?:\s|$)")),
+    ("test", re.compile(r"(?:^|[;&|]\s*)(?:uv|poetry|pipenv)\s+run\s+(?:pytest|python(?:3)?\s+-m\s+(?:pytest|unittest))(?:\s|$)")),
+    ("test", re.compile(r"(?:^|[;&|]\s*)(?:cargo|go|dotnet|swift|flutter)\s+test(?:\s|$)")),
+    ("test", re.compile(r"(?:^|[;&|]\s*)(?:mvn|gradle|gradlew|\.\/gradlew).*\btest\b")),
+    ("test", re.compile(r"(?:^|[;&|]\s*)(?:make|just)\s+(?:test|check)(?:\s|$)")),
+    ("test", re.compile(r"\bxcodebuild\b.*\btest\b")),
+    ("lint", re.compile(r"(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?lint(?:\s|$)")),
+    ("lint", re.compile(r"(?:^|[;&|]\s*)(?:ruff\s+check|eslint|biome\s+check|golangci-lint\s+run|cargo\s+clippy|go\s+vet)(?:\s|$)")),
+    ("typecheck", re.compile(r"(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:typecheck|type-check)(?:\s|$)")),
+    ("typecheck", re.compile(r"(?:^|[;&|]\s*)(?:tsc|mypy|pyright)(?:\s|$)")),
+    ("typecheck", re.compile(r"(?:^|[;&|]\s*)cargo\s+check(?:\s|$)")),
+    ("build", re.compile(r"(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build(?:\s|$)")),
+    ("build", re.compile(r"(?:^|[;&|]\s*)(?:cargo|dotnet)\s+build(?:\s|$)")),
+    ("build", re.compile(r"(?:^|[;&|]\s*)mvn(?:\s+[^;&|]+)*\s+(?:package|verify)(?:\s|$)")),
+]
+
+BOOLEAN_CONFIG_FIELDS = {
+    "require_verification_when_code_changed",
+    "block_on_failed_verification",
+    "block_on_debug_markers",
+    "block_on_sensitive_files",
+}
+
+VERIFICATION_KINDS = {"test", "lint", "typecheck", "build"}
+ALLOW_DEBUG_MARKER = re.compile(r"doneguard:\s*allow-debug", re.IGNORECASE)
+
+DEBUG_MARKERS: list[tuple[str, re.Pattern[str]]] = [
+    ("TODO/FIXME/HACK", re.compile(r"\b(?:TODO|FIXME|HACK)\b")),
+    ("console.log", re.compile(r"\bconsole\.log\s*\(")),
+    ("debugger", re.compile(r"\bdebugger\s*;?")),
+    ("Python breakpoint", re.compile(r"\b(?:breakpoint|pdb\.set_trace)\s*\(")),
+    ("Ruby binding.pry", re.compile(r"\bbinding\.pry\b")),
+]
+
+SENSITIVE_PATH_PATTERNS = [
+    re.compile(r"(^|/)\.env(?:\.|$)"),
+    re.compile(r"\.(?:pem|key|p12|pfx)$", re.IGNORECASE),
+    re.compile(r"(^|/)(?:credentials|secrets?)(?:\.|/|$)", re.IGNORECASE),
+]
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def plugin_data_dir() -> Path:
+    raw = os.environ.get("PLUGIN_DATA")
+    if raw:
+        path = Path(raw)
+    else:
+        path = Path.home() / ".codex" / "doneguard-data"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def safe_id(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)[:160] or "unknown"
+
+
+def state_path(session_id: str) -> Path:
+    path = plugin_data_dir() / "sessions"
+    path.mkdir(parents=True, exist_ok=True)
+    return path / f"{safe_id(session_id)}.json"
+
+
+@contextmanager
+def state_lock(session_id: str) -> Iterator[None]:
+    """Serialize read-modify-write cycles for hooks from the same session."""
+    lock_path = state_path(session_id).with_suffix(".lock")
+    descriptor: int | None = None
+    for _ in range(50):
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(descriptor, f"{os.getpid()}\n".encode())
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > 30:
+                    lock_path.unlink()
+                    continue
+            except FileNotFoundError:
+                continue
+            time.sleep(0.02)
+    if descriptor is None:
+        raise TimeoutError(f"Could not acquire DoneGuard session lock: {lock_path}")
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def load_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+
+
+def save_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.replace(path)
+
+
+def new_state(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "session_id": str(event.get("session_id") or "unknown"),
+        "cwd": str(event.get("cwd") or os.getcwd()),
+        "started_at": now_iso(),
+        "sequence": 0,
+        "last_change_sequence": 0,
+        "prompt_count": 0,
+        "files_touched": [],
+        "fingerprint_cache": {},
+        "verifications": [],
+    }
+
+
+def load_config(cwd: Path) -> tuple[dict[str, Any], list[str]]:
+    warnings: list[str] = []
+    config = {
+        **DEFAULT_CONFIG,
+        "ignore_paths": list(DEFAULT_CONFIG["ignore_paths"]),
+        "debug_marker_ignore_paths": [],
+        "debug_markers": {
+            key: list(value) if isinstance(value, list) else value
+            for key, value in DEFAULT_CONFIG["debug_markers"].items()
+        },
+        "fingerprint_limits": dict(DEFAULT_CONFIG["fingerprint_limits"]),
+        "verification_commands": [],
+    }
+    root = repo_root(cwd) or cwd
+    config_path = root / ".doneguard.json"
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return config, warnings
+    except json.JSONDecodeError as exc:
+        return config, [f"Invalid .doneguard.json: {exc.msg} at line {exc.lineno}, column {exc.colno}; defaults were used."]
+    except OSError as exc:
+        return config, [f"Could not read .doneguard.json: {exc}; defaults were used."]
+    if not isinstance(raw, dict):
+        return config, [".doneguard.json must contain a JSON object; defaults were used."]
+
+    unknown = sorted(set(raw) - set(DEFAULT_CONFIG))
+    if unknown:
+        warnings.append("Unknown .doneguard.json field(s): " + ", ".join(unknown))
+    config.update(raw)
+
+    if config.get("schema_version") not in {1, 2, 3}:
+        warnings.append("Unsupported schema_version; version 3 semantics were used.")
+        config["schema_version"] = 3
+    if config.get("mode") not in {"observe", "warn", "strict"}:
+        warnings.append("Unknown DoneGuard mode; using warn.")
+        config["mode"] = "warn"
+
+    for field in BOOLEAN_CONFIG_FIELDS:
+        if not isinstance(config.get(field), bool):
+            warnings.append(f"{field} must be a boolean; the default was used.")
+            config[field] = DEFAULT_CONFIG[field]
+
+    for field in ("ignore_paths", "debug_marker_ignore_paths"):
+        value = config.get(field)
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            fallback = list(DEFAULT_CONFIG.get(field, []))
+            warnings.append(f"{field} must be an array of strings; defaults were used.")
+            config[field] = fallback
+
+    debug_config = config.get("debug_markers")
+    if not isinstance(debug_config, dict):
+        warnings.append("debug_markers must be an object; defaults were used.")
+        debug_config = dict(DEFAULT_CONFIG["debug_markers"])
+    else:
+        debug_config = {**DEFAULT_CONFIG["debug_markers"], **debug_config}
+    for field in ("block", "warn", "ignore_paths"):
+        value = debug_config.get(field)
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            warnings.append(f"debug_markers.{field} must be an array of strings; defaults were used.")
+            debug_config[field] = list(DEFAULT_CONFIG["debug_markers"][field])
+    if not isinstance(debug_config.get("allow_comment"), str):
+        warnings.append("debug_markers.allow_comment must be a string; the default was used.")
+        debug_config["allow_comment"] = DEFAULT_CONFIG["debug_markers"]["allow_comment"]
+    known_labels = {label for label, _ in DEBUG_MARKERS}
+    for field in ("block", "warn"):
+        unknown_labels = sorted(set(debug_config[field]) - known_labels)
+        if unknown_labels:
+            warnings.append(f"debug_markers.{field} contains unknown label(s): " + ", ".join(unknown_labels))
+            debug_config[field] = [label for label in debug_config[field] if label in known_labels]
+    config["debug_markers"] = debug_config
+
+    limits = config.get("fingerprint_limits")
+    if not isinstance(limits, dict):
+        warnings.append("fingerprint_limits must be an object; defaults were used.")
+        limits = dict(DEFAULT_CONFIG["fingerprint_limits"])
+    else:
+        limits = {**DEFAULT_CONFIG["fingerprint_limits"], **limits}
+    for field in ("max_files", "max_total_bytes", "timeout_ms"):
+        if not isinstance(limits.get(field), int) or isinstance(limits.get(field), bool) or limits[field] <= 0:
+            warnings.append(f"fingerprint_limits.{field} must be a positive integer; the default was used.")
+            limits[field] = DEFAULT_CONFIG["fingerprint_limits"][field]
+    config["fingerprint_limits"] = limits
+
+    commands = config.get("verification_commands")
+    if not isinstance(commands, list):
+        warnings.append("verification_commands must be an array; defaults were used.")
+        config["verification_commands"] = []
+    else:
+        valid_commands: list[dict[str, Any]] = []
+        for index, item in enumerate(commands):
+            if not isinstance(item, dict) or item.get("kind") not in VERIFICATION_KINDS:
+                warnings.append(f"verification_commands[{index}] has an invalid kind or shape and was ignored.")
+                continue
+            text_selectors = [
+                key for key in ("command", "command_prefix", "pattern")
+                if isinstance(item.get(key), str) and item[key]
+            ]
+            argv_valid = (
+                isinstance(item.get("argv"), list)
+                and bool(item["argv"])
+                and all(isinstance(value, str) and value for value in item["argv"])
+            )
+            selectors = text_selectors + (["argv"] if argv_valid else [])
+            if len(selectors) != 1:
+                warnings.append(f"verification_commands[{index}] must define exactly one command selector and was ignored.")
+                continue
+            if selectors[0] == "pattern":
+                try:
+                    re.compile(item["pattern"])
+                except re.error as exc:
+                    warnings.append(f"verification_commands[{index}] has an invalid pattern ({exc}) and was ignored.")
+                    continue
+            rule: dict[str, Any] = {
+                "id": item.get("id") if isinstance(item.get("id"), str) and item["id"] else f"custom-{index + 1}",
+                "kind": item["kind"],
+                selectors[0]: item[selectors[0]],
+                "required": item.get("required", False),
+                "covers": item.get("covers", []),
+                "when_changed": item.get("when_changed", item.get("covers", [])),
+                "fingerprint_paths": item.get(
+                    "fingerprint_paths", item.get("when_changed", item.get("covers", []))
+                ),
+                "artifacts": item.get("artifacts", []),
+                "cwd": item.get("cwd", "."),
+                "structured": selectors[0] == "argv",
+            }
+            if not isinstance(rule["required"], bool):
+                warnings.append(f"verification_commands[{index}].required must be a boolean and was set to false.")
+                rule["required"] = False
+            if not isinstance(rule["covers"], list) or any(not isinstance(path, str) for path in rule["covers"]):
+                warnings.append(f"verification_commands[{index}].covers must be an array of strings and was cleared.")
+                rule["covers"] = []
+            for field in ("when_changed", "fingerprint_paths"):
+                if not isinstance(rule[field], list) or any(not isinstance(path, str) for path in rule[field]):
+                    warnings.append(f"verification_commands[{index}].{field} must be an array of strings and was cleared.")
+                    rule[field] = []
+            if not isinstance(rule["cwd"], str) or not rule["cwd"]:
+                warnings.append(f"verification_commands[{index}].cwd must be a non-empty string and was set to '.'.")
+                rule["cwd"] = "."
+            if config.get("schema_version") == 3 and rule["required"] and not rule["structured"]:
+                warnings.append(
+                    f"verification_commands[{index}] is required but uses a heuristic selector; Schema 3 required rules should use argv."
+                )
+            artifacts = rule["artifacts"]
+            if not isinstance(artifacts, list):
+                warnings.append(f"verification_commands[{index}].artifacts must be an array and was cleared.")
+                artifacts = []
+            valid_artifacts: list[dict[str, Any]] = []
+            for artifact_index, artifact in enumerate(artifacts):
+                prefix = f"verification_commands[{index}].artifacts[{artifact_index}]"
+                if not isinstance(artifact, dict) or not isinstance(artifact.get("path"), str) or not artifact["path"]:
+                    warnings.append(f"{prefix} must define a path and was ignored.")
+                    continue
+                artifact_format = artifact.get("format", "coverage-summary")
+                if artifact_format not in {"coverage-summary", "istanbul-summary"}:
+                    warnings.append(f"{prefix}.format is unsupported and was ignored.")
+                    continue
+                thresholds = artifact.get("thresholds", {})
+                if not isinstance(thresholds, dict) or any(
+                    key not in {"lines", "branches", "functions", "statements"}
+                    or not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or value < 0 or value > 100
+                    for key, value in thresholds.items()
+                ):
+                    warnings.append(f"{prefix}.thresholds is invalid and was cleared.")
+                    thresholds = {}
+                max_age = artifact.get("max_age_seconds", 300)
+                if not isinstance(max_age, (int, float)) or isinstance(max_age, bool) or max_age <= 0:
+                    warnings.append(f"{prefix}.max_age_seconds is invalid and was set to 300.")
+                    max_age = 300
+                valid_artifacts.append({
+                    "path": artifact["path"],
+                    "format": artifact_format,
+                    "thresholds": thresholds,
+                    "max_age_seconds": max_age,
+                })
+            rule["artifacts"] = valid_artifacts
+            valid_commands.append(rule)
+        config["verification_commands"] = valid_commands
+    return config, warnings
+
+
+def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=8,
+        check=False,
+    )
+
+
+def repo_root(cwd: Path) -> Path | None:
+    try:
+        result = run_git(cwd, "rev-parse", "--show-toplevel")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return Path(result.stdout.strip())
+
+
+def changed_paths(cwd: Path) -> list[str]:
+    root = repo_root(cwd)
+    if root is None:
+        return []
+    paths: set[str] = set()
+    commands = [
+        ("diff", "--name-only", "--relative", "HEAD"),
+        ("diff", "--cached", "--name-only", "--relative", "HEAD"),
+        ("ls-files", "--others", "--exclude-standard"),
+    ]
+    for args in commands:
+        result = run_git(root, *args)
+        if result.returncode == 0:
+            paths.update(line.strip() for line in result.stdout.splitlines() if line.strip())
+    if paths:
+        return sorted(paths)
+    # Repositories without an initial commit do not have HEAD.
+    status = run_git(root, "status", "--porcelain=v1")
+    if status.returncode == 0:
+        for line in status.stdout.splitlines():
+            if len(line) > 3:
+                paths.add(line[3:].split(" -> ")[-1].strip())
+    return sorted(paths)
+
+
+def ignored(path: str, prefixes: list[Any]) -> bool:
+    normalized = path.replace("\\", "/").lstrip("./")
+    return any(normalized.startswith(str(prefix).replace("\\", "/").lstrip("./")) for prefix in prefixes)
+
+
+def code_changed(paths: list[str]) -> bool:
+    return any(Path(path).suffix.lower() in CODE_EXTENSIONS or Path(path).name in CODE_FILENAMES for path in paths)
+
+
+def fingerprint_patterns(config: dict[str, Any]) -> list[str]:
+    patterns: list[str] = []
+    for rule in config.get("verification_commands", []):
+        patterns.extend(rule.get("when_changed", []))
+        patterns.extend(rule.get("fingerprint_paths", []))
+    return patterns
+
+
+def fingerprint_relevant(path: str, config: dict[str, Any]) -> bool:
+    return code_changed([path]) or path_matches(path, fingerprint_patterns(config))
+
+
+def project_path(root: Path, path: str) -> Path | None:
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        candidate.resolve(strict=False).relative_to(root.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def path_matches(path: str, patterns: list[str]) -> bool:
+    normalized = path.replace("\\", "/").lstrip("./")
+    for pattern in patterns:
+        normalized_pattern = pattern.replace("\\", "/").lstrip("./")
+        if fnmatch.fnmatchcase(normalized, normalized_pattern):
+            return True
+        if normalized_pattern.endswith("/**") and normalized.startswith(normalized_pattern[:-3].rstrip("/") + "/"):
+            return True
+    return False
+
+
+def git_blob_hashes(root: Path, paths: list[str], timeout_seconds: float) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    deadline = time.monotonic() + max(timeout_seconds, 0.05)
+    for offset in range(0, len(paths), 200):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        batch = paths[offset:offset + 200]
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(root), "hash-object", "--", *batch],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=remaining,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            break
+        values = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if result.returncode != 0 or len(values) != len(batch):
+            break
+        hashes.update(zip(batch, values))
+    return hashes
+
+
+def fingerprint_cache_path(cwd: Path) -> Path:
+    root = repo_root(cwd) or cwd
+    identifier = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
+    return plugin_data_dir() / "fingerprint-cache" / f"{identifier}.json"
+
+
+def load_persistent_fingerprint_cache(cwd: Path) -> dict[str, Any]:
+    payload = load_json(fingerprint_cache_path(cwd), {})
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return {}
+    entries = payload.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def save_persistent_fingerprint_cache(cwd: Path, cache: dict[str, Any], max_entries: int) -> None:
+    entries = dict(list(cache.items())[-max(max_entries, 1):])
+    save_json(fingerprint_cache_path(cwd), {
+        "schema_version": 1,
+        "updated_at": now_iso(),
+        "entries": entries,
+    })
+
+
+def merkle_fingerprint(entries: dict[str, tuple[str, str]], complete: bool, reason: str) -> tuple[str, int]:
+    leaves: list[bytes] = []
+    for path in sorted(entries):
+        kind, file_hash = entries[path]
+        payload = "\0".join((path, kind, file_hash)).encode("utf-8", errors="surrogateescape")
+        leaves.append(hashlib.sha256(b"leaf\0" + payload).digest())
+    chunks = [
+        hashlib.sha256(b"chunk\0" + b"".join(leaves[offset:offset + 256])).digest()
+        for offset in range(0, len(leaves), 256)
+    ]
+    root = hashlib.sha256(b"merkle-v1\0" + b"".join(chunks))
+    if not complete:
+        root.update(b"INCOMPLETE\0")
+        root.update(reason.encode())
+    return "sha256:" + root.hexdigest(), len(chunks)
+
+
+def workspace_fingerprint_details(
+    cwd: Path,
+    paths: list[str],
+    config: dict[str, Any],
+    cache: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Hash relevant changed code under an explicit time and I/O budget."""
+    started = time.monotonic()
+    root = repo_root(cwd) or cwd
+    relevant = sorted({
+        path.replace("\\", "/")
+        for path in paths
+        if not ignored(path, config["ignore_paths"]) and fingerprint_relevant(path, config)
+    })
+    limits = config.get("fingerprint_limits", DEFAULT_CONFIG["fingerprint_limits"])
+    max_files = int(limits["max_files"])
+    max_bytes = int(limits["max_total_bytes"])
+    timeout_seconds = int(limits["timeout_ms"]) / 1000
+    fingerprint_cache = cache if isinstance(cache, dict) else {}
+    complete = True
+    limit_reason = ""
+    selected = relevant
+    if len(selected) > max_files:
+        selected = selected[:max_files]
+        complete = False
+        limit_reason = f"max_files exceeded ({len(relevant)} > {max_files})"
+
+    entries: dict[str, tuple[str, str]] = {}
+    pending: list[tuple[str, Path, os.stat_result, str]] = []
+    cache_hits = 0
+    bytes_hashed = 0
+    total_bytes = 0
+    for path in selected:
+        if time.monotonic() - started > timeout_seconds:
+            complete = False
+            limit_reason = limit_reason or f"timeout exceeded ({limits['timeout_ms']} ms)"
+            break
+        target = project_path(root, path)
+        if target is None:
+            entries[path] = ("outside-root", "")
+            continue
+        try:
+            stat = target.lstat()
+        except OSError:
+            entries[path] = ("deleted-or-unreadable", "")
+            continue
+        mode = f"{stat.st_mode & 0o777:o}"
+        if target.is_symlink():
+            try:
+                entries[path] = (f"symlink:{mode}", hashlib.sha256(os.readlink(target).encode()).hexdigest())
+            except OSError:
+                entries[path] = (f"symlink-unreadable:{mode}", "")
+            continue
+        if not target.is_file():
+            entries[path] = (f"non-file:{mode}", "")
+            continue
+        signature = f"{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}:{stat.st_mode}"
+        total_bytes += stat.st_size
+        cached = fingerprint_cache.get(path)
+        if isinstance(cached, dict) and cached.get("signature") == signature and isinstance(cached.get("hash"), str):
+            entries[path] = (f"file:{mode}", cached["hash"])
+            cache_hits += 1
+            fingerprint_cache.pop(path, None)
+            fingerprint_cache[path] = cached
+            continue
+        if bytes_hashed + stat.st_size > max_bytes:
+            complete = False
+            limit_reason = limit_reason or f"max_total_bytes exceeded ({bytes_hashed + stat.st_size} > {max_bytes})"
+            break
+        pending.append((path, target, stat, signature))
+        bytes_hashed += stat.st_size
+
+    remaining = max(0.05, timeout_seconds - (time.monotonic() - started))
+    relative_pending = [path for path, _, _, _ in pending]
+    git_hashes = git_blob_hashes(root, relative_pending, remaining) if repo_root(cwd) is not None else {}
+    for path, target, stat, signature in pending:
+        if time.monotonic() - started > timeout_seconds:
+            complete = False
+            limit_reason = limit_reason or f"timeout exceeded ({limits['timeout_ms']} ms)"
+            break
+        file_hash = git_hashes.get(path)
+        if file_hash is None:
+            try:
+                file_digest = hashlib.sha256()
+                with target.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        file_digest.update(chunk)
+                file_hash = file_digest.hexdigest()
+            except OSError:
+                complete = False
+                limit_reason = limit_reason or f"could not hash {path}"
+                break
+        mode = f"{stat.st_mode & 0o777:o}"
+        entries[path] = (f"file:{mode}", file_hash)
+        fingerprint_cache[path] = {"signature": signature, "hash": file_hash}
+
+    fingerprint, chunk_count = merkle_fingerprint(entries, complete, limit_reason)
+    duration_ms = round((time.monotonic() - started) * 1000, 3)
+    return {
+        "fingerprint": fingerprint,
+        "metrics": {
+            "algorithm": "merkle-v1",
+            "chunk_count": chunk_count,
+            "file_count": len(relevant),
+            "processed_files": len(entries),
+            "total_bytes": total_bytes,
+            "bytes_hashed": bytes_hashed,
+            "cache_hits": cache_hits,
+            "duration_ms": duration_ms,
+            "complete": complete,
+            "limit_reason": limit_reason or None,
+        },
+    }
+
+
+def cached_workspace_fingerprint(
+    cwd: Path,
+    paths: list[str],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    cache = load_persistent_fingerprint_cache(cwd)
+    result = workspace_fingerprint_details(cwd, paths, config, cache)
+    max_entries = int(config.get("fingerprint_limits", DEFAULT_CONFIG["fingerprint_limits"])["max_files"]) * 2
+    save_persistent_fingerprint_cache(cwd, cache, max_entries)
+    return result
+
+
+def workspace_fingerprint(cwd: Path, paths: list[str], config: dict[str, Any]) -> str:
+    return str(workspace_fingerprint_details(cwd, paths, config)["fingerprint"])
+
+
+def parse_simple_command(command: str) -> dict[str, Any]:
+    if "\n" in command:
+        return {"complete": False, "reason": "multiline command"}
+    if "$(" in command or "`" in command:
+        return {"complete": False, "reason": "command substitution"}
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError as exc:
+        return {"complete": False, "reason": f"shell parse error: {exc}"}
+    operators = {";", "&", "&&", "|", "||", "<", ">", ">>", "<<", "<&", ">&"}
+    if any(token in operators or set(token) <= set(";&|<>") for token in tokens if token):
+        return {"complete": False, "reason": "compound command or redirection"}
+    index = 0
+    if tokens and tokens[0] == "env":
+        index = 1
+    assignment = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
+    while index < len(tokens) and assignment.match(tokens[index]):
+        index += 1
+    argv = tokens[index:]
+    if not argv:
+        return {"complete": False, "reason": "no executable"}
+    return {"complete": True, "argv": argv}
+
+
+def command_matches_rule(
+    command: str,
+    item: dict[str, Any],
+    cwd: Path | None = None,
+) -> bool:
+    normalized = " ".join(command.split())
+    if "argv" in item:
+        parsed = parse_simple_command(command)
+        if not parsed.get("complete") or parsed.get("argv") != item["argv"]:
+            return False
+        expected_cwd = str(item.get("cwd") or ".")
+        if cwd is not None:
+            root = repo_root(cwd) or cwd
+            expected = Path(expected_cwd)
+            if not expected.is_absolute():
+                expected = root / expected
+            if cwd.resolve() != expected.resolve():
+                return False
+        return True
+    if "command" in item:
+        return normalized == " ".join(str(item["command"]).split())
+    if "command_prefix" in item:
+        prefix = " ".join(str(item["command_prefix"]).split())
+        return normalized == prefix or normalized.startswith(prefix + " ")
+    if "pattern" in item:
+        return re.search(str(item["pattern"]), normalized) is not None
+    return False
+
+
+def rule_fingerprint(rule: dict[str, Any]) -> str:
+    payload = json.dumps(rule, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
+def match_verification(
+    command: str,
+    config: dict[str, Any] | None = None,
+    cwd: Path | None = None,
+) -> dict[str, Any] | None:
+    parsed = parse_simple_command(command)
+    if not parsed.get("complete"):
+        return None
+    normalized = " ".join(command.split())
+    structured_candidate = False
+    for item in (config or {}).get("verification_commands", []):
+        if "argv" in item and parsed.get("argv") == item["argv"]:
+            structured_candidate = True
+        if command_matches_rule(command, item, cwd):
+            return item
+    if structured_candidate:
+        return None
+    normalized = " ".join(str(value) for value in parsed["argv"])
+    for kind, pattern in VERIFY_PATTERNS:
+        if pattern.search(normalized):
+            return {
+                "id": f"builtin-{kind}",
+                "kind": kind,
+                "required": False,
+                "covers": [],
+                "artifacts": [],
+            }
+    return None
+
+
+def classify_verification(
+    command: str,
+    config: dict[str, Any] | None = None,
+    cwd: Path | None = None,
+) -> str | None:
+    rule = match_verification(command, config, cwd)
+    return str(rule["kind"]) if rule else None
+
+
+def redact_command(command: str) -> str:
+    """Remove common inline secrets before persisting a command."""
+    normalized = " ".join(command.split())
+    normalized = re.sub(
+        r"(?i)\b([A-Z_][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|AUTH)[A-Z0-9_]*)=(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)",
+        lambda match: f"{match.group(1)}=<redacted>",
+        normalized,
+    )
+    normalized = re.sub(
+        r"(?i)(--(?:token|secret|password|passwd|api-key|authorization))(?:=|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)",
+        lambda match: f"{match.group(1)}=<redacted>",
+        normalized,
+    )
+    return normalized[:500]
+
+
+def verification_key(item: dict[str, Any]) -> tuple[str, str]:
+    identifier = str(item.get("verification_id") or "")
+    if identifier:
+        return identifier, ""
+    return str(item.get("kind") or "unknown"), " ".join(str(item.get("command") or "").split())
+
+
+def file_sha256(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def coverage_metrics(data: Any, artifact_format: str) -> dict[str, float] | None:
+    if not isinstance(data, dict):
+        return None
+    if artifact_format == "coverage-summary":
+        source = data.get("coverage", data)
+        if not isinstance(source, dict):
+            return None
+        metrics = {
+            key: float(value)
+            for key, value in source.items()
+            if key in {"lines", "branches", "functions", "statements"}
+            and isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        return metrics or None
+    total = data.get("total")
+    if not isinstance(total, dict):
+        return None
+    metrics: dict[str, float] = {}
+    for key in ("lines", "branches", "functions", "statements"):
+        value = total.get(key)
+        if isinstance(value, dict) and isinstance(value.get("pct"), (int, float)):
+            metrics[key] = float(value["pct"])
+    return metrics or None
+
+
+def capture_artifact_evidence(cwd: Path, rule: dict[str, Any]) -> list[dict[str, Any]]:
+    root = repo_root(cwd) or cwd
+    now = time.time()
+    evidence: list[dict[str, Any]] = []
+    for spec in rule.get("artifacts", []):
+        path = str(spec["path"])
+        target = project_path(root, path)
+        item: dict[str, Any] = {"path": path, "format": spec["format"], "valid": False, "errors": []}
+        if target is None or not target.is_file():
+            item["errors"].append("artifact is missing")
+            evidence.append(item)
+            continue
+        try:
+            stat = target.stat()
+            data = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            item["errors"].append(f"artifact could not be read: {type(exc).__name__}")
+            evidence.append(item)
+            continue
+        metrics = coverage_metrics(data, spec["format"])
+        if metrics is None:
+            item["errors"].append("coverage metrics were not found")
+        age_seconds = max(0.0, now - stat.st_mtime)
+        if age_seconds > float(spec["max_age_seconds"]):
+            item["errors"].append(
+                f"artifact is stale ({age_seconds:.1f}s > {spec['max_age_seconds']}s)"
+            )
+        for key, threshold in spec["thresholds"].items():
+            actual = None if metrics is None else metrics.get(key)
+            if actual is None:
+                item["errors"].append(f"{key} coverage is missing")
+            elif actual < float(threshold):
+                item["errors"].append(f"{key} coverage {actual:.2f}% is below {float(threshold):.2f}%")
+        item.update({
+            "hash": file_sha256(target),
+            "mtime_ns": stat.st_mtime_ns,
+            "age_seconds": round(age_seconds, 3),
+            "metrics": metrics or {},
+        })
+        item["valid"] = not item["errors"] and item["hash"] is not None
+        evidence.append(item)
+    return evidence
+
+
+def artifact_evidence_errors(cwd: Path, item: dict[str, Any], rule: dict[str, Any]) -> list[str]:
+    root = repo_root(cwd) or cwd
+    recorded = {entry.get("path"): entry for entry in item.get("artifact_evidence", [])}
+    errors: list[str] = []
+    for spec in rule.get("artifacts", []):
+        path = str(spec["path"])
+        evidence = recorded.get(path)
+        if not isinstance(evidence, dict):
+            errors.append(f"{path}: no artifact evidence was recorded")
+            continue
+        errors.extend(f"{path}: {message}" for message in evidence.get("errors", []))
+        target = project_path(root, path)
+        current_hash = file_sha256(target) if target is not None and target.is_file() else None
+        if evidence.get("hash") != current_hash:
+            errors.append(f"{path}: artifact changed after verification")
+        metrics = evidence.get("metrics", {})
+        for key, threshold in spec["thresholds"].items():
+            actual = metrics.get(key) if isinstance(metrics, dict) else None
+            if isinstance(actual, (int, float)) and actual < float(threshold):
+                message = f"{path}: {key} coverage {actual:.2f}% is below {float(threshold):.2f}%"
+                if message not in errors:
+                    errors.append(message)
+    return errors
+
+
+def extract_exit_code(value: Any) -> int | None:
+    if isinstance(value, dict):
+        for key in ("exit_code", "exitCode", "status_code", "statusCode"):
+            if key in value and isinstance(value[key], int):
+                return value[key]
+        for nested in value.values():
+            found = extract_exit_code(nested)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = extract_exit_code(nested)
+            if found is not None:
+                return found
+    elif isinstance(value, str):
+        patterns = [
+            r"(?:exit(?:ed)?(?: with)?(?: code| status)?|exit_code)\D{0,8}(-?\d+)",
+            r"Process completed with code\s+(-?\d+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, value, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+    return None
+
+
+def command_text(value: Any) -> str:
+    if isinstance(value, str):
+        return " ".join(value.split())
+    if isinstance(value, list) and value:
+        return command_text(value[-1])
+    return ""
+
+
+def command_executions(value: Any):
+    if isinstance(value, dict):
+        if value.get("type") == "CommandExecution":
+            yield value
+        for nested in value.values():
+            yield from command_executions(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from command_executions(nested)
+
+
+def transcript_exit_code(event: dict[str, Any], command: str) -> int | None:
+    """Recover a shell exit code when PostToolUse omits it from tool_response.
+
+    Codex normally exposes the command result in the session transcript as a
+    CommandExecution item. The transcript is only a compatibility fallback;
+    tool_response remains the preferred, stable source.
+    """
+    raw_path = event.get("transcript_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+
+    expected_id = str(event.get("tool_use_id") or "")
+    expected_command = command_text(command)
+    try:
+        with Path(raw_path).open(encoding="utf-8") as handle:
+            recent_lines = deque(handle, maxlen=4000)
+    except OSError:
+        return None
+
+    for line in reversed(recent_lines):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for item in command_executions(record):
+            exit_code = extract_exit_code(item)
+            if exit_code is None:
+                continue
+            if expected_id and str(item.get("id") or "") == expected_id:
+                return exit_code
+            if expected_command and command_text(item.get("command")) == expected_command:
+                return exit_code
+    return None
+
+
+def command_from_event(event: dict[str, Any]) -> str:
+    tool_input = event.get("tool_input")
+    if isinstance(tool_input, dict):
+        for key in ("command", "cmd"):
+            if isinstance(tool_input.get(key), str):
+                return tool_input[key]
+    return ""
+
+
+def patch_paths(command: str) -> list[str]:
+    patterns = [
+        r"^\*\*\* (?:Add|Update|Delete) File:\s+(.+?)\s*$",
+        r"^\+\+\+\s+b/(.+?)\s*$",
+    ]
+    paths: set[str] = set()
+    for line in command.splitlines():
+        for pattern in patterns:
+            match = re.match(pattern, line)
+            if match:
+                paths.add(match.group(1))
+    return sorted(paths)
+
+
+def mask_string_literals(lines: list[str], path: str) -> list[str]:
+    """Mask quoted text while preserving line numbers and comment text."""
+    masked: list[str] = []
+    quote = ""
+    triple = ""
+    escaped = False
+    supports_triples = Path(path).suffix.lower() == ".py"
+    for line in lines:
+        output: list[str] = []
+        index = 0
+        while index < len(line):
+            if triple:
+                if line.startswith(triple, index):
+                    output.extend(" " * len(triple))
+                    index += len(triple)
+                    triple = ""
+                else:
+                    output.append(" ")
+                    index += 1
+                continue
+            character = line[index]
+            if quote:
+                output.append(" ")
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = ""
+                index += 1
+                continue
+            candidate = line[index:index + 3]
+            if supports_triples and candidate in {"'''", '\"\"\"'}:
+                triple = candidate
+                output.extend("   ")
+                index += 3
+                continue
+            if character in {"'", '"', "`"}:
+                quote = character
+                output.append(" ")
+                index += 1
+                continue
+            output.append(character)
+            index += 1
+        masked.append("".join(output))
+        if quote and quote != "`":
+            quote = ""
+            escaped = False
+    return masked
+
+
+def mask_python_strings(text: str, path: str) -> tuple[list[str], dict[str, Any]]:
+    lines = text.splitlines()
+    masked = [list(line) for line in lines]
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(text).readline)
+        for token in tokens:
+            if token.type != tokenize.STRING:
+                continue
+            start_line, start_column = token.start
+            end_line, end_column = token.end
+            for line_number in range(start_line, end_line + 1):
+                if line_number < 1 or line_number > len(masked):
+                    continue
+                first = start_column if line_number == start_line else 0
+                last = end_column if line_number == end_line else len(masked[line_number - 1])
+                for column in range(first, min(last, len(masked[line_number - 1]))):
+                    masked[line_number - 1][column] = " "
+        return ["".join(line) for line in masked], {
+            "path": path, "engine": "python-tokenize", "complete": True, "error": None,
+        }
+    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+        return mask_string_literals(lines, path), {
+            "path": path,
+            "engine": "python-tokenize-fallback",
+            "complete": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def mask_javascript_strings(text: str, path: str) -> tuple[list[str], dict[str, Any]]:
+    output = list(text)
+    mode = "normal"
+    escaped = False
+    regex_character_class = False
+    template_depths: list[int] = []
+    previous_significant = ""
+    index = 0
+
+    def hide(position: int) -> None:
+        if output[position] not in {"\n", "\r"}:
+            output[position] = " "
+
+    while index < len(text):
+        character = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if mode == "line-comment":
+            if character == "\n":
+                mode = "normal"
+            index += 1
+            continue
+        if mode == "block-comment":
+            if character == "*" and following == "/":
+                index += 2
+                mode = "normal"
+            else:
+                index += 1
+            continue
+        if mode in {"single", "double"}:
+            hide(index)
+            if character in {"\n", "\r"} and not escaped:
+                mode = "normal"
+            elif escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif (mode == "single" and character == "'") or (mode == "double" and character == '"'):
+                mode = "normal"
+            index += 1
+            continue
+        if mode == "regex":
+            hide(index)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == "[":
+                regex_character_class = True
+            elif character == "]":
+                regex_character_class = False
+            elif character == "/" and not regex_character_class:
+                mode = "normal"
+                previous_significant = "/"
+            elif character in {"\n", "\r"}:
+                mode = "normal"
+            index += 1
+            continue
+        if mode == "template":
+            hide(index)
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+            if character == "\\":
+                escaped = True
+                index += 1
+                continue
+            if character == "`":
+                mode = "normal"
+                previous_significant = "`"
+                index += 1
+                continue
+            if character == "$" and following == "{":
+                hide(index + 1)
+                template_depths.append(1)
+                mode = "normal"
+                previous_significant = "{"
+                index += 2
+                continue
+            index += 1
+            continue
+
+        if character == "/" and following == "/":
+            mode = "line-comment"
+            index += 2
+            continue
+        if character == "/" and following == "*":
+            mode = "block-comment"
+            index += 2
+            continue
+        if character == "'":
+            hide(index)
+            mode = "single"
+            escaped = False
+            index += 1
+            continue
+        if character == '"':
+            hide(index)
+            mode = "double"
+            escaped = False
+            index += 1
+            continue
+        if character == "`":
+            hide(index)
+            mode = "template"
+            escaped = False
+            index += 1
+            continue
+        if character == "/" and following not in {"/", "*"} and (
+            not previous_significant or previous_significant in "([{:;,=!?&|+-*%^~<>"
+        ):
+            hide(index)
+            mode = "regex"
+            escaped = False
+            regex_character_class = False
+            index += 1
+            continue
+        if template_depths and character == "{":
+            template_depths[-1] += 1
+        elif template_depths and character == "}":
+            template_depths[-1] -= 1
+            if template_depths[-1] == 0:
+                template_depths.pop()
+                hide(index)
+                mode = "template"
+                previous_significant = "}"
+                index += 1
+                continue
+        if not character.isspace():
+            previous_significant = character
+        index += 1
+
+    complete = mode in {"normal", "line-comment"} and not template_depths
+    return "".join(output).splitlines(), {
+        "path": path,
+        "engine": "javascript-lexer",
+        "complete": complete,
+        "error": None if complete else f"unterminated {mode}",
+    }
+
+
+def scan_source_text(text: str, path: str) -> tuple[list[str], dict[str, Any]]:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".py":
+        return mask_python_strings(text, path)
+    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        return mask_javascript_strings(text, path)
+    return mask_string_literals(text.splitlines(), path), {
+        "path": path, "engine": "generic-lexer", "complete": True, "error": None,
+    }
+
+
+def added_line_numbers(cwd: Path, paths: list[str]) -> dict[str, set[int]]:
+    root = repo_root(cwd)
+    if root is None or not paths:
+        return {}
+    result = run_git(root, "diff", "--unified=0", "HEAD", "--", *paths)
+    if result.returncode != 0:
+        return {}
+    added: dict[str, set[int]] = {}
+    current_file = ""
+    new_line = 0
+    in_hunk = False
+    for line in result.stdout.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+            added.setdefault(current_file, set())
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            match = re.search(r"\+(\d+)(?:,(\d+))?", line)
+            if match:
+                new_line = int(match.group(1))
+                in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            added.setdefault(current_file, set()).add(new_line)
+            new_line += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            continue
+        elif not line.startswith("\\"):
+            new_line += 1
+    return added
+
+
+def untracked_paths(cwd: Path) -> set[str]:
+    root = repo_root(cwd)
+    if root is None:
+        return set()
+    result = run_git(root, "ls-files", "--others", "--exclude-standard")
+    if result.returncode != 0:
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def added_debug_markers(cwd: Path, paths: list[str], config: dict[str, Any]) -> dict[str, Any]:
+    root = repo_root(cwd)
+    if root is None or not paths:
+        return {"warnings": [], "blockers": [], "scan": {"complete": True, "files": []}}
+    debug_config = config.get("debug_markers", DEFAULT_CONFIG["debug_markers"])
+    ignored_paths = list(config.get("debug_marker_ignore_paths", [])) + list(debug_config.get("ignore_paths", []))
+    debug_paths = [
+        path for path in paths
+        if code_changed([path]) and not ignored(path, ignored_paths)
+    ]
+    if not debug_paths:
+        return {"warnings": [], "blockers": [], "scan": {"complete": True, "files": []}}
+    findings: dict[str, Any] = {
+        "warnings": [], "blockers": [], "scan": {"complete": True, "files": []},
+    }
+    untracked = untracked_paths(root)
+    tracked_paths = [path for path in debug_paths if path not in untracked]
+    line_numbers = added_line_numbers(root, tracked_paths)
+    head = run_git(root, "rev-parse", "--verify", "HEAD")
+    if head.returncode != 0:
+        line_numbers = {}
+    for path in sorted(debug_paths):
+        target = project_path(root, path)
+        if target is None or not target.is_file():
+            continue
+        try:
+            raw = target.read_bytes()
+        except OSError as exc:
+            findings["scan"]["complete"] = False
+            findings["scan"]["files"].append({
+                "path": path, "engine": "unreadable", "complete": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            continue
+        if b"\0" in raw[:8192]:
+            continue
+        truncated = len(raw) > 1024 * 1024
+        text = raw[:1024 * 1024].decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        masked, scan = scan_source_text(text, path)
+        if truncated:
+            scan["complete"] = False
+            scan["error"] = "file exceeds 1 MiB scan limit"
+        findings["scan"]["files"].append(scan)
+        if not scan["complete"]:
+            findings["scan"]["complete"] = False
+        selected_lines = set(range(1, len(lines) + 1)) if head.returncode != 0 or path in untracked else line_numbers.get(path, set())
+        for line_number in sorted(selected_lines):
+            if line_number < 1 or line_number > len(lines):
+                continue
+            original = lines[line_number - 1]
+            allow_comment = str(debug_config.get("allow_comment") or "")
+            if allow_comment and allow_comment.lower() in original.lower():
+                continue
+            searchable = masked[line_number - 1]
+            for label, pattern in DEBUG_MARKERS:
+                if len(findings["warnings"]) + len(findings["blockers"]) >= 5:
+                    break
+                if not pattern.search(searchable):
+                    continue
+                message = f"{path}:{line_number}: {label}"
+                if config.get("block_on_debug_markers") or label in debug_config.get("block", []):
+                    findings["blockers"].append(message)
+                elif label in debug_config.get("warn", []):
+                    findings["warnings"].append(message)
+    return findings
+
+
+def sensitive_paths(paths: list[str]) -> list[str]:
+    return [path for path in paths if any(pattern.search(path.replace("\\", "/")) for pattern in SENSITIVE_PATH_PATTERNS)]
+
+
+def covered_paths_for_rule(rule: dict[str, Any], paths: list[str]) -> list[str]:
+    patterns = rule.get("covers", [])
+    if not patterns:
+        return list(paths)
+    return [path for path in paths if path_matches(path, patterns)]
+
+
+def triggered_paths_for_rule(rule: dict[str, Any], paths: list[str]) -> list[str]:
+    patterns = rule.get("when_changed", [])
+    if patterns:
+        return [path for path in paths if path_matches(path, patterns)]
+    return [path for path in paths if code_changed([path])]
+
+
+def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    cwd = Path(str(event.get("cwd") or state.get("cwd") or os.getcwd())).resolve()
+    config, config_warnings = load_config(cwd)
+    paths = [path for path in changed_paths(cwd) if not ignored(path, config["ignore_paths"])]
+    touched = [path for path in state.get("files_touched", []) if not ignored(path, config["ignore_paths"])]
+    all_paths = sorted(set(paths) if repo_root(cwd) is not None else set(touched))
+    code_paths = [path for path in all_paths if code_changed([path])]
+    relevant_code_changed = bool(code_paths)
+    verifications = state.get("verifications", [])
+    fingerprint = cached_workspace_fingerprint(cwd, all_paths, config)
+    current_fingerprint = fingerprint["fingerprint"]
+    fingerprint_complete = bool(fingerprint["metrics"]["complete"])
+    configured_rules = {
+        str(rule["id"]): rule for rule in config.get("verification_commands", [])
+    }
+    current_evidence = [
+        item for item in verifications
+        if item.get("workspace_fingerprint") == current_fingerprint
+        and item.get("fingerprint_complete", True)
+        and fingerprint_complete
+        and (
+            str(item.get("verification_id", "")).startswith("builtin-")
+            or (
+                str(item.get("verification_id", "")) in configured_rules
+                and item.get("rule_fingerprint")
+                == rule_fingerprint(configured_rules[str(item.get("verification_id"))])
+            )
+        )
+    ]
+    latest_by_command: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in current_evidence:
+        latest_by_command[verification_key(item)] = item
+    latest_results = sorted(
+        latest_by_command.values(), key=lambda item: int(item.get("sequence") or 0)
+    )
+    candidate_successful = [item for item in latest_results if item.get("success") is True]
+    failed = [item for item in latest_results if item.get("success") is False]
+    unknown = [item for item in latest_results if item.get("success") is None]
+
+    blockers: list[str] = []
+    warnings = list(config_warnings)
+    passed: list[str] = []
+
+    if not fingerprint_complete:
+        warnings.append(
+            "workspace fingerprint is incomplete: "
+            + str(fingerprint["metrics"].get("limit_reason") or "unknown limit")
+        )
+
+    successful: list[dict[str, Any]] = []
+    artifact_passed: list[str] = []
+    for item in candidate_successful:
+        identifier = str(item.get("verification_id") or "")
+        rule = configured_rules.get(identifier)
+        if rule is None or not rule.get("artifacts"):
+            successful.append(item)
+            continue
+        errors = artifact_evidence_errors(cwd, item, rule)
+        if errors:
+            blockers.append(
+                f"verification {identifier} has invalid artifact evidence: " + "; ".join(errors[:5])
+            )
+            continue
+        successful.append(item)
+        for artifact in item.get("artifact_evidence", []):
+            metrics = artifact.get("metrics", {})
+            if metrics:
+                summary = ", ".join(f"{key} {float(value):.2f}%" for key, value in sorted(metrics.items()))
+                artifact_passed.append(f"{identifier} coverage ({summary})")
+
+    required_rules = [rule for rule in configured_rules.values() if rule.get("required")]
+    coverage_map: dict[str, list[str]] = {}
+    covered_by_required: set[str] = set()
+    latest_by_id = {str(item.get("verification_id") or ""): item for item in latest_results}
+    successful_ids = {str(item.get("verification_id") or "") for item in successful}
+    for rule in required_rules:
+        covered = triggered_paths_for_rule(rule, all_paths)
+        if not covered:
+            continue
+        identifier = str(rule["id"])
+        coverage_map[identifier] = covered
+        covered_by_required.update(covered)
+        if config.get("schema_version") == 3 and not rule.get("structured"):
+            blockers.append(
+                f"required verification {identifier} uses a heuristic command selector; Schema 3 requires argv"
+            )
+            continue
+        if identifier not in successful_ids:
+            if identifier not in latest_by_id:
+                blockers.append(
+                    f"required verification {identifier} was not recorded for: " + ", ".join(covered[:5])
+                )
+            elif latest_by_id[identifier].get("success") is not True:
+                blockers.append(
+                    f"required verification {identifier} did not succeed for: " + ", ".join(covered[:5])
+                )
+    uncovered = sorted(set(code_paths) - covered_by_required) if required_rules else []
+    if uncovered:
+        blockers.append(
+            "changed code is not covered by a required verification rule: " + ", ".join(uncovered[:5])
+        )
+
+    if relevant_code_changed and config.get("require_verification_when_code_changed") and not successful:
+        blockers.append("code changed, but no successful test, lint, typecheck, or build was recorded after the latest observed edit")
+        if verifications and not current_evidence:
+            warnings.append("recorded verification evidence is stale because relevant code content changed")
+    if failed and config.get("block_on_failed_verification"):
+        latest = failed[-1]
+        blockers.append(f"the latest recorded {latest['kind']} command failed: {latest['command']}")
+    if successful:
+        labels = ", ".join(f"{item['kind']}: {item['command']}" for item in successful[-3:])
+        passed.append(f"successful verification recorded ({labels})")
+    passed.extend(artifact_passed)
+    if coverage_map and not uncovered:
+        passed.append(f"required verification coverage mapped for {len(covered_by_required)} changed file(s)")
+    if unknown:
+        warnings.append("some verification commands had an unknown exit status and were not counted as successful")
+
+    debug = added_debug_markers(cwd, paths, config)
+    if debug["warnings"]:
+        warnings.append("new debug or temporary markers found: " + "; ".join(debug["warnings"]))
+    if debug["blockers"]:
+        blockers.append("blocking debug markers found: " + "; ".join(debug["blockers"]))
+    if not debug["scan"]["complete"]:
+        incomplete = [
+            f"{item['path']} ({item.get('error') or 'unknown error'})"
+            for item in debug["scan"]["files"] if not item.get("complete")
+        ]
+        warnings.append("debug marker scan is incomplete: " + "; ".join(incomplete[:5]))
+
+    sensitive = sensitive_paths(all_paths)
+    if sensitive:
+        message = "sensitive-looking files changed: " + ", ".join(sensitive[:5])
+        (blockers if config.get("block_on_sensitive_files") else warnings).append(message)
+
+    if all_paths:
+        passed.append(f"{len(all_paths)} changed or touched file(s) inspected")
+
+    return {
+        "schema_version": 3,
+        "checked_at": now_iso(),
+        "session_id": str(event.get("session_id") or state.get("session_id") or "unknown"),
+        "cwd": str(cwd),
+        "mode": config["mode"],
+        "workspace_fingerprint": current_fingerprint,
+        "fingerprint_metrics": fingerprint["metrics"],
+        "changed_paths": all_paths,
+        "verification_coverage": coverage_map,
+        "debug_scan": debug["scan"],
+        "verification_evidence": latest_results[-10:],
+        "passed": passed,
+        "warnings": warnings,
+        "blockers": blockers,
+    }
+
+
+def save_report(report: dict[str, Any]) -> Path:
+    reports = plugin_data_dir() / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    session = safe_id(str(report.get("session_id") or "unknown"))
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    path = reports / f"{timestamp}-{session}.json"
+    save_json(path, report)
+    save_json(reports / "latest.json", report)
+    return path
+
+
+def format_report(report: dict[str, Any]) -> str:
+    pieces = [f"DoneGuard ({report['mode']})"]
+    if report["passed"]:
+        pieces.append("Passed: " + "; ".join(report["passed"]))
+    if report["warnings"]:
+        pieces.append("Warnings: " + "; ".join(report["warnings"]))
+    if report["blockers"]:
+        pieces.append("Needs attention: " + "; ".join(report["blockers"]))
+    if not report["changed_paths"] and not report["warnings"] and not report["blockers"]:
+        pieces.append("No relevant workspace changes detected.")
+    return "\n".join(pieces)
+
+
+def _handle_hook_locked(event: dict[str, Any]) -> dict[str, Any] | None:
+    session_id = str(event.get("session_id") or "unknown")
+    path = state_path(session_id)
+    hook_name = str(event.get("hook_event_name") or "")
+
+    if hook_name == "SessionStart" and event.get("source") in {"startup", "clear"}:
+        save_json(path, new_state(event))
+        return None
+
+    state = load_json(path, None)
+    if not isinstance(state, dict):
+        state = new_state(event)
+    state["sequence"] = int(state.get("sequence") or 0) + 1
+    state["cwd"] = str(event.get("cwd") or state.get("cwd") or os.getcwd())
+
+    if hook_name == "UserPromptSubmit":
+        state["prompt_count"] = int(state.get("prompt_count") or 0) + 1
+        state.pop("last_prompt", None)
+        save_json(path, state)
+        return None
+
+    if hook_name == "PostToolUse":
+        tool_name = str(event.get("tool_name") or "")
+        command = command_from_event(event)
+        if tool_name == "apply_patch":
+            paths = set(state.get("files_touched", []))
+            paths.update(patch_paths(command))
+            state["files_touched"] = sorted(paths)
+            state["last_change_sequence"] = state["sequence"]
+        elif tool_name == "Bash":
+            cwd = Path(str(event.get("cwd") or state.get("cwd") or os.getcwd())).resolve()
+            config, _ = load_config(cwd)
+            rule = match_verification(command, config, cwd)
+            if rule:
+                exit_code = extract_exit_code(event.get("tool_response"))
+                exit_code_source = "tool_response"
+                if exit_code is None:
+                    exit_code = transcript_exit_code(event, command)
+                    exit_code_source = "transcript" if exit_code is not None else "unknown"
+                current_paths = changed_paths(cwd)
+                if repo_root(cwd) is None:
+                    current_paths = list(state.get("files_touched", []))
+                fingerprint = cached_workspace_fingerprint(cwd, current_paths, config)
+                state.setdefault("verifications", []).append({
+                    "sequence": state["sequence"],
+                    "verification_id": rule["id"],
+                    "rule_fingerprint": rule_fingerprint(rule),
+                    "kind": rule["kind"],
+                    "evidence_strength": "structured" if rule.get("structured") else "heuristic",
+                    "command": redact_command(command),
+                    "exit_code": exit_code,
+                    "exit_code_source": exit_code_source,
+                    "success": None if exit_code is None else exit_code == 0,
+                    "workspace_fingerprint": fingerprint["fingerprint"],
+                    "fingerprint_complete": fingerprint["metrics"]["complete"],
+                    "fingerprint_metrics": fingerprint["metrics"],
+                    "artifact_evidence": capture_artifact_evidence(cwd, rule),
+                    "recorded_at": now_iso(),
+                })
+                state["verifications"] = state["verifications"][-30:]
+        save_json(path, state)
+        return None
+
+    if hook_name == "Stop":
+        save_json(path, state)
+        report = evaluate(event, state)
+        save_report(report)
+        if not report["changed_paths"] and not report["warnings"] and not report["blockers"]:
+            return None
+        message = format_report(report)
+        mode = report["mode"]
+        if mode == "observe":
+            return None
+        if mode == "strict" and report["blockers"] and not bool(event.get("stop_hook_active")):
+            return {
+                "decision": "block",
+                "reason": message + "\nBefore finishing, address the blocking evidence or explain why it cannot be produced."
+            }
+        return {"systemMessage": message}
+
+    if hook_name == "SessionEnd":
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return None
+
+    save_json(path, state)
+    return None
+
+
+def handle_hook(event: dict[str, Any]) -> dict[str, Any] | None:
+    session_id = str(event.get("session_id") or "unknown")
+    try:
+        with state_lock(session_id):
+            return _handle_hook_locked(event)
+    except TimeoutError as exc:
+        return {"systemMessage": str(exc)}
+
+
+def latest_report(cwd: Path | None) -> dict[str, Any] | None:
+    reports = plugin_data_dir() / "reports"
+    if not reports.exists():
+        return None
+    candidates = sorted(reports.glob("*.json"), reverse=True)
+    for path in candidates:
+        if path.name == "latest.json":
+            continue
+        report = load_json(path, None)
+        if not isinstance(report, dict):
+            continue
+        if cwd is None or Path(str(report.get("cwd", ""))).resolve() == cwd.resolve():
+            return report
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="DoneGuard completion evidence checker")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("hook", help="Process a Codex hook event from stdin")
+    status_parser = subparsers.add_parser("status", help="Show the latest saved report")
+    status_parser.add_argument("--cwd", type=Path)
+    status_parser.add_argument("--json", action="store_true", dest="as_json")
+    args = parser.parse_args()
+
+    if args.command == "hook":
+        try:
+            event = json.load(sys.stdin)
+        except json.JSONDecodeError as exc:
+            print(json.dumps({"systemMessage": f"DoneGuard received invalid hook JSON: {exc}"}))
+            return 0
+        result = handle_hook(event)
+        if result is not None:
+            print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    report = latest_report(args.cwd)
+    if report is None:
+        print("DoneGuard has not saved a report for this project yet.")
+        return 1
+    print(json.dumps(report, ensure_ascii=False, indent=2) if args.as_json else format_report(report))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
