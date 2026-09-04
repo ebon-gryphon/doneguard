@@ -2,7 +2,20 @@
 
 DoneGuard 是一个面向 Codex 的本地完成检查插件。它会观察代码改动和验证命令，在任务结束前检查当前工作区是否具备足够的新鲜验证证据。可选的 macOS Companion 会在项目外显示一条带二次元水豚的右上角通知，并在用户查看完整报告后再询问是否保存。
 
-当前版本适用于 Git 仓库。默认模式为 `warn`，它会展示报告，但不会阻止任务结束。
+当前版本默认保护 Git 仓库，也会保护全局 Skill、插件和 Codex CLI 配置；非 Git 目录可以通过 `.doneguard.json` 显式启用。默认模式为 `warn`，它会展示报告，但不会阻止任务结束。
+
+DoneGuard 以“本轮是否修改了受保护的工程资产”为触发条件。只读问答、新闻搜索和资料查询不会因为工作区里早先遗留的未提交改动而生成新报告。同一个工作区指纹和问题状态只通知一次，内容或验证状态变化后才会再次通知。
+
+## 安装和更新
+
+DoneGuard 当前通过个人 marketplace 安装。
+
+```bash
+codex plugin add doneguard@personal
+zsh /path/to/doneguard/scripts/install_companion_macos.sh
+```
+
+更新插件后请新建 Codex 任务，让新任务加载新的 skill 和 hook。
 
 ## 它解决什么问题
 
@@ -29,7 +42,7 @@ DoneGuard 提供的是完成证据。报告通过说明插件观察到的相关�
 
 ## 项目配置
 
-在 Git 仓库根目录创建 `.doneguard.json`。最小配置如下。
+在 Git 仓库根目录创建 `.doneguard.json`。也可以在非 Git 工程目录中创建该文件，将该目录显式纳入保护。最小配置如下。
 
 ```json
 {
@@ -140,6 +153,23 @@ DoneGuard 内置识别常见的测试、lint、类型检查和构建命令，包
 
 同一工作区指纹下，同一个验证规则只采用最新结果。一次失败后重新运行并成功，旧失败会被新结果覆盖。验证以后再次修改 `when_changed` 或 `fingerprint_paths` 命中的代码、配置、迁移、文档等输入，Merkle 指纹随之变化，原有证据会被标记为过期。必需规则还会验证覆盖率产物的哈希、新鲜度和阈值。
 
+## 何时保持安静
+
+DoneGuard 在每次用户提示开始时记录当前 Git 状态，并只为本轮发生的受保护变更生成报告。下面几类任务默认保持安静。
+
+- 仅搜索新闻、浏览资料或回答问题，没有修改工程文件。
+- 当前 Git 仓库虽然已有脏文件，但本轮没有继续修改，也没有运行验证。
+- 在未配置 `.doneguard.json` 的普通非 Git 目录编辑一般文件。
+
+下面几类修改仍会触发检查。
+
+- 当前 Git 仓库或本轮实际触碰到的其他 Git 仓库。
+- `$CODEX_HOME/skills`、`$CODEX_HOME/plugins`、`$CODEX_HOME/bin`、`config.toml` 和 `AGENTS.md`。
+- `~/.agents/skills` 与 `~/.agents/plugins`。
+- 使用 `.doneguard.json` 显式启用的非 Git 目录。
+
+报告作用域由实际修改的文件决定，不要求它们位于聊天启动目录中。全局工程资产使用文件内容指纹，而不是依赖 Git。相同指纹、提醒和阻断项已经通知过时，后续无状态变化的停止事件不会重复弹窗。
+
 ## 调试标记和敏感文件
 
 DoneGuard 会检查已跟踪改动和未跟踪源文件中的新增内容。目前内置识别 `TODO`、`FIXME`、`HACK`、`console.log`、`debugger`、Python 断点和 Ruby `binding.pry`。Python 文件使用标准库 `tokenize`，JavaScript 和 TypeScript 使用支持注释、正则、模板字符串及 `${...}` 表达式的语言词法扫描器，其他语言使用通用扫描器。
@@ -189,17 +219,6 @@ python3 /path/to/doneguard/scripts/doneguard.py report-action save <report-id>
 python3 /path/to/doneguard/scripts/doneguard.py report-action discard <report-id>
 ```
 
-## 安装和更新
-
-DoneGuard 当前通过个人 marketplace 安装。
-
-```bash
-codex plugin add doneguard@personal
-zsh /path/to/doneguard/scripts/install_companion_macos.sh
-```
-
-更新插件后请新建 Codex 任务，让新任务加载新的 skill 和 hook。
-
 ## 开发验证
 
 插件本身只依赖 Python 标准库。
@@ -210,7 +229,7 @@ python3 -m unittest -v tests/test_doneguard.py
 python3 -m py_compile scripts/doneguard.py
 ```
 
-当前插件包含 47 项 Python 单元测试和一项 Swift 报告删除烟雾测试；原有黑盒与端到端验证项目继续保留。测试覆盖 Companion 缺失时的安全降级、临时报告事件、明确保存与删除、中文小白解释、过期清理、以及 strict 首次续跑不误发完成弹窗。
+当前插件包含 56 项 Python 单元测试和一项 Swift 报告删除烟雾测试；原有黑盒与端到端验证项目继续保留。测试覆盖 Companion 缺失时的安全降级、临时报告事件、明确保存与删除、中文小白解释、过期清理、只读任务静默、跨仓库和全局资产作用域、重复通知抑制，以及 strict 首次续跑不误发完成弹窗。
 
 ## 当前边界
 
