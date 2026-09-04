@@ -336,11 +336,11 @@ struct SummaryView: View {
     }
 
     var body: some View {
-        HStack(spacing: 13) {
+        HStack(spacing: 10) {
             MascotImage(status: report.status)
-                .frame(width: 88, height: 116)
+                .frame(width: 66, height: 88)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 13) {
+            VStack(alignment: .leading, spacing: 7) {
                 HStack(spacing: 6) {
                     Circle().fill(accent).frame(width: 7, height: 7)
                     Text(report.projectName)
@@ -349,30 +349,34 @@ struct SummaryView: View {
                         .foregroundStyle(.secondary)
                 }
                 Text(report.headline)
-                    .font(.system(size: 18, weight: .bold, design: .rounded))
-                    .lineLimit(2)
+                    .font(.system(size: 15.5, weight: .bold, design: .rounded))
+                    .lineLimit(1)
                 Text(report.plainSummary)
-                    .font(.system(size: 12.5))
+                    .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(1)
 
                 HStack(spacing: 8) {
                     Button("查看报告", action: showDetails)
                         .buttonStyle(.borderedProminent)
                         .tint(accent)
                         .controlSize(.small)
+                        .font(.system(size: 12.5, weight: .semibold))
+                    Spacer(minLength: 24)
                     Button("稍后", action: postpone)
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                        .font(.system(size: 12.5, weight: .semibold))
                 }
+                .frame(maxWidth: .infinity)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(14)
-        .frame(width: 400, height: 168)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(11)
+        .frame(width: 368, height: 116)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color.primary.opacity(0.10), lineWidth: 1)
         }
     }
@@ -600,8 +604,8 @@ struct ContentView: View {
                     Text(store.errorMessage ?? "等待 DoneGuard 报告…")
                         .foregroundStyle(.secondary)
                 }
-                .frame(width: 400, height: 168)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .frame(width: 368, height: 116)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             }
         }
         .onReceive(poller) { _ in store.poll() }
@@ -624,7 +628,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 400, height: 168),
+            contentRect: NSRect(x: 0, y: 0, width: 368, height: 116),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -675,7 +679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .floating
         panel.backgroundColor = .clear
         panel.isOpaque = false
-        panel.setContentSize(NSSize(width: 400, height: 168))
+        panel.setContentSize(NSSize(width: 368, height: 116))
         let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first
         if let visible = screen?.visibleFrame {
             panel.setFrameOrigin(NSPoint(
