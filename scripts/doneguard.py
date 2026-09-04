@@ -126,6 +126,10 @@ SENSITIVE_PATH_PATTERNS = [
     re.compile(r"(^|/)(?:credentials|secrets?)(?:\.|/|$)", re.IGNORECASE),
 ]
 
+MANAGED_CODEX_SUBTREES = ("skills", "plugins", "bin")
+MANAGED_CODEX_FILES = ("config.toml", "AGENTS.md")
+MANAGED_AGENTS_SUBTREES = ("skills", "plugins")
+
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -205,6 +209,7 @@ def new_state(event: dict[str, Any]) -> dict[str, Any]:
         "last_change_sequence": 0,
         "prompt_count": 0,
         "files_touched": [],
+        "turn_files_touched": [],
         "fingerprint_cache": {},
         "verifications": [],
     }
@@ -223,7 +228,7 @@ def load_config(cwd: Path) -> tuple[dict[str, Any], list[str]]:
         "fingerprint_limits": dict(DEFAULT_CONFIG["fingerprint_limits"]),
         "verification_commands": [],
     }
-    root = repo_root(cwd) or cwd
+    root = guard_root(cwd)
     config_path = root / ".doneguard.json"
     try:
         raw = json.loads(config_path.read_text(encoding="utf-8"))
@@ -421,6 +426,46 @@ def repo_root(cwd: Path) -> Path | None:
     return Path(result.stdout.strip())
 
 
+def explicit_config_root(cwd: Path) -> Path | None:
+    """Find the nearest opt-in root for a directory that is not in Git."""
+    current = cwd if cwd.is_dir() else cwd.parent
+    for candidate in (current, *current.parents):
+        if (candidate / ".doneguard.json").is_file():
+            return candidate
+    return None
+
+
+def guard_root(cwd: Path) -> Path:
+    return repo_root(cwd) or explicit_config_root(cwd) or cwd
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def codex_home() -> Path:
+    raw = os.environ.get("CODEX_HOME")
+    return Path(raw).expanduser().resolve(strict=False) if raw else (Path.home() / ".codex").resolve(strict=False)
+
+
+def managed_global_root(path: Path) -> Path | None:
+    """Return the owner root for known global Codex engineering assets."""
+    target = path.resolve(strict=False)
+    codex = codex_home()
+    if target in {codex / name for name in MANAGED_CODEX_FILES}:
+        return codex
+    if any(path_is_within(target, codex / name) for name in MANAGED_CODEX_SUBTREES):
+        return codex
+    agents = (Path.home() / ".agents").resolve(strict=False)
+    if any(path_is_within(target, agents / name) for name in MANAGED_AGENTS_SUBTREES):
+        return agents
+    return None
+
+
 def changed_paths(cwd: Path) -> list[str]:
     root = repo_root(cwd)
     if root is None:
@@ -464,7 +509,11 @@ def fingerprint_patterns(config: dict[str, Any]) -> list[str]:
 
 
 def fingerprint_relevant(path: str, config: dict[str, Any]) -> bool:
-    return code_changed([path]) or path_matches(path, fingerprint_patterns(config))
+    return (
+        bool(config.get("_fingerprint_all_paths"))
+        or code_changed([path])
+        or path_matches(path, fingerprint_patterns(config))
+    )
 
 
 def project_path(root: Path, path: str) -> Path | None:
@@ -476,6 +525,14 @@ def project_path(root: Path, path: str) -> Path | None:
     except ValueError:
         return None
     return candidate
+
+
+def fingerprint_target(root: Path, path: str) -> Path | None:
+    """Resolve report paths, allowing already-vetted absolute external assets."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate.resolve(strict=False)
+    return project_path(root, path)
 
 
 def path_matches(path: str, patterns: list[str]) -> bool:
@@ -516,7 +573,7 @@ def git_blob_hashes(root: Path, paths: list[str], timeout_seconds: float) -> dic
 
 
 def fingerprint_cache_path(cwd: Path) -> Path:
-    root = repo_root(cwd) or cwd
+    root = guard_root(cwd)
     identifier = hashlib.sha256(str(root.resolve()).encode()).hexdigest()
     return plugin_data_dir() / "fingerprint-cache" / f"{identifier}.json"
 
@@ -563,7 +620,7 @@ def workspace_fingerprint_details(
 ) -> dict[str, Any]:
     """Hash relevant changed code under an explicit time and I/O budget."""
     started = time.monotonic()
-    root = repo_root(cwd) or cwd
+    root = guard_root(cwd)
     relevant = sorted({
         path.replace("\\", "/")
         for path in paths
@@ -592,7 +649,7 @@ def workspace_fingerprint_details(
             complete = False
             limit_reason = limit_reason or f"timeout exceeded ({limits['timeout_ms']} ms)"
             break
-        target = project_path(root, path)
+        target = fingerprint_target(root, path)
         if target is None:
             entries[path] = ("outside-root", "")
             continue
@@ -628,7 +685,7 @@ def workspace_fingerprint_details(
         bytes_hashed += stat.st_size
 
     remaining = max(0.05, timeout_seconds - (time.monotonic() - started))
-    relative_pending = [path for path, _, _, _ in pending]
+    relative_pending = [path for path, _, _, _ in pending if not Path(path).is_absolute()]
     git_hashes = git_blob_hashes(root, relative_pending, remaining) if repo_root(cwd) is not None else {}
     for path, target, stat, signature in pending:
         if time.monotonic() - started > timeout_seconds:
@@ -686,6 +743,121 @@ def workspace_fingerprint(cwd: Path, paths: list[str], config: dict[str, Any]) -
     return str(workspace_fingerprint_details(cwd, paths, config)["fingerprint"])
 
 
+def scope_for_path(path: Path) -> tuple[str, Path] | None:
+    """Classify an edited path without assuming it belongs to the chat cwd."""
+    target = path.resolve(strict=False)
+    owner = target if target.is_dir() else target.parent
+    repository = repo_root(owner)
+    if repository is not None and path_is_within(target, repository):
+        return "git", repository.resolve(strict=False)
+    configured = explicit_config_root(owner)
+    if configured is not None and path_is_within(target, configured):
+        return "configured", configured.resolve(strict=False)
+    managed = managed_global_root(target)
+    if managed is not None:
+        return "global", managed
+    return None
+
+
+def scope_path(root: Path, path: Path) -> str:
+    try:
+        return path.resolve(strict=False).relative_to(root.resolve(strict=False)).as_posix()
+    except ValueError:
+        return str(path.resolve(strict=False))
+
+
+def runtime_config(cwd: Path, kind: str) -> tuple[dict[str, Any], list[str]]:
+    config, warnings = load_config(cwd)
+    if kind == "global":
+        config = {**config, "_fingerprint_all_paths": True}
+    return config, warnings
+
+
+def git_workspace_snapshot(cwd: Path) -> dict[str, Any] | None:
+    root = repo_root(cwd)
+    if root is None:
+        return None
+    config, _ = load_config(root)
+    paths = [path for path in changed_paths(root) if not ignored(path, config["ignore_paths"])]
+    fingerprint = workspace_fingerprint_details(root, paths, config)
+    return {
+        "root": str(root.resolve(strict=False)),
+        "fingerprint": fingerprint["fingerprint"],
+    }
+
+
+def recent_verifications(state: dict[str, Any]) -> list[dict[str, Any]]:
+    values = [item for item in state.get("verifications", []) if isinstance(item, dict)]
+    boundary = state.get("turn_started_sequence")
+    if not isinstance(boundary, int):
+        return values
+    return [item for item in values if int(item.get("sequence") or 0) >= boundary]
+
+
+def determine_turn_scope(cwd: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Resolve whether this turn changed a protected engineering scope."""
+    has_turn_boundary = isinstance(state.get("turn_started_sequence"), int)
+    raw_touched = state.get("turn_files_touched", []) if has_turn_boundary else state.get("files_touched", [])
+    grouped: dict[tuple[str, str], list[Path]] = {}
+    for raw in raw_touched:
+        if not isinstance(raw, str) or not raw:
+            continue
+        target = Path(raw).expanduser()
+        if not target.is_absolute():
+            target = cwd / target
+        owner = scope_for_path(target)
+        if owner is None:
+            continue
+        kind, root = owner
+        grouped.setdefault((kind, str(root)), []).append(target.resolve(strict=False))
+
+    if grouped:
+        (kind, root_text), primary_paths = max(
+            grouped.items(), key=lambda item: (len(item[1]), item[0][1])
+        )
+        root = Path(root_text)
+        protected = sorted({
+            scope_path(root, target)
+            for values in grouped.values()
+            for target in values
+        })
+        return {"active": True, "kind": kind, "root": root, "paths": protected}
+
+    latest = recent_verifications(state)
+    if latest:
+        verification_root = latest[-1].get("scope_root")
+        root = Path(str(verification_root)).resolve(strict=False) if verification_root else guard_root(cwd)
+        kind = str(latest[-1].get("scope_kind") or "")
+        if kind not in {"git", "configured", "global"}:
+            kind = "git" if repo_root(root) is not None else ("global" if managed_global_root(root) else "configured")
+        config, _ = runtime_config(root, kind)
+        paths = [path for path in changed_paths(root) if not ignored(path, config["ignore_paths"])]
+        return {"active": True, "kind": kind, "root": root, "paths": paths}
+
+    baseline = state.get("turn_git_baseline")
+    current = git_workspace_snapshot(cwd)
+    if isinstance(baseline, dict) and current is not None:
+        if baseline.get("root") == current.get("root") and baseline.get("fingerprint") != current.get("fingerprint"):
+            root = Path(str(current["root"]))
+            config, _ = load_config(root)
+            paths = [path for path in changed_paths(root) if not ignored(path, config["ignore_paths"])]
+            return {"active": True, "kind": "git", "root": root, "paths": paths}
+
+    # Older sessions and direct unit tests may not contain a prompt boundary.
+    if not has_turn_boundary:
+        root = repo_root(cwd)
+        if root is not None:
+            config, _ = load_config(root)
+            paths = [path for path in changed_paths(root) if not ignored(path, config["ignore_paths"])]
+            if paths:
+                return {"active": True, "kind": "git", "root": root, "paths": paths}
+        configured = explicit_config_root(cwd)
+        if configured is not None:
+            return {"active": True, "kind": "configured", "root": configured, "paths": []}
+
+    return {"active": False, "kind": "none", "root": guard_root(cwd), "paths": []}
+
+
 def parse_simple_command(command: str) -> dict[str, Any]:
     if "\n" in command:
         return {"complete": False, "reason": "multiline command"}
@@ -725,7 +897,7 @@ def command_matches_rule(
             return False
         expected_cwd = str(item.get("cwd") or ".")
         if cwd is not None:
-            root = repo_root(cwd) or cwd
+            root = guard_root(cwd)
             expected = Path(expected_cwd)
             if not expected.is_absolute():
                 expected = root / expected
@@ -846,7 +1018,7 @@ def coverage_metrics(data: Any, artifact_format: str) -> dict[str, float] | None
 
 
 def capture_artifact_evidence(cwd: Path, rule: dict[str, Any]) -> list[dict[str, Any]]:
-    root = repo_root(cwd) or cwd
+    root = guard_root(cwd)
     now = time.time()
     evidence: list[dict[str, Any]] = []
     for spec in rule.get("artifacts", []):
@@ -890,7 +1062,7 @@ def capture_artifact_evidence(cwd: Path, rule: dict[str, Any]) -> list[dict[str,
 
 
 def artifact_evidence_errors(cwd: Path, item: dict[str, Any], rule: dict[str, Any]) -> list[str]:
-    root = repo_root(cwd) or cwd
+    root = guard_root(cwd)
     recorded = {entry.get("path"): entry for entry in item.get("artifact_evidence", [])}
     errors: list[str] = []
     for spec in rule.get("artifacts", []):
@@ -1015,6 +1187,27 @@ def patch_paths(command: str) -> list[str]:
             if match:
                 paths.add(match.group(1))
     return sorted(paths)
+
+
+def event_working_directory(event: dict[str, Any], fallback: str | Path) -> Path:
+    tool_input = event.get("tool_input")
+    if isinstance(tool_input, dict):
+        for key in ("workdir", "cwd"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value:
+                return Path(value).expanduser().resolve(strict=False)
+    return Path(str(event.get("cwd") or fallback)).expanduser().resolve(strict=False)
+
+
+def absolute_patch_paths(event: dict[str, Any], fallback: str | Path) -> list[str]:
+    base = event_working_directory(event, fallback)
+    values: list[str] = []
+    for raw in patch_paths(command_from_event(event)):
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        values.append(str(candidate.resolve(strict=False)))
+    return sorted(set(values))
 
 
 def mask_string_literals(lines: list[str], path: str) -> list[str]:
@@ -1410,7 +1603,17 @@ def plain_finding(message: str, category: str) -> dict[str, str]:
             "next_step": "请运行适合该项目的测试或构建命令，然后确认命令成功结束。",
             "technical_detail": message,
         }
-    if message == "recorded verification evidence is stale because relevant code content changed":
+    if message == "protected engineering assets changed, but no successful test, lint, typecheck, or build was recorded after the latest observed edit":
+        return {
+            "title": "全局工程配置改动后还没有验证",
+            "detail": "检测到全局 Skill、插件或 Codex CLI 配置发生了修改，但修改后没有找到成功的验证记录。",
+            "next_step": "请运行适合该资产的校验或烟雾测试，并确认命令成功结束。",
+            "technical_detail": message,
+        }
+    if message in {
+        "recorded verification evidence is stale because relevant code content changed",
+        "recorded verification evidence is stale because relevant engineering content changed",
+    }:
         return {
             "title": "之前的检查结果已经过期",
             "detail": "虽然之前运行过检查，但代码后来又发生了变化。旧结果不能说明当前代码仍然正常。",
@@ -1549,7 +1752,7 @@ def plain_language_report(report: dict[str, Any]) -> dict[str, Any]:
         headline = "任务已完成检查"
         summary = "DoneGuard 找到了与当前改动匹配的完成证据，没有发现需要阻止交付的问题。"
 
-    has_missing_verification = any(item.startswith("code changed, but no successful") for item in blockers)
+    has_missing_verification = any("changed, but no successful" in item for item in blockers)
     has_failed_verification = any(item.startswith("the latest recorded ") for item in blockers)
     debug_blocked = any("debug" in item or "temporary markers" in item for item in blockers)
     debug_warned = any("debug" in item or "temporary markers" in item for item in warnings)
@@ -1565,7 +1768,7 @@ def plain_language_report(report: dict[str, Any]) -> dict[str, Any]:
         {
             "title": "测试与构建记录",
             "status": "issue" if has_missing_verification or has_failed_verification else ("passed" if has_success else "neutral"),
-            "detail": "代码改动后还缺少成功的验证记录。" if has_missing_verification else ("最近一次验证失败。" if has_failed_verification else ("已找到最后一次修改后的成功记录。" if has_success else "本次没有代码改动，因此不要求运行测试或构建。")),
+            "detail": "工程资产改动后还缺少成功的验证记录。" if has_missing_verification else ("最近一次验证失败。" if has_failed_verification else ("已找到最后一次修改后的成功记录。" if has_success else "本次没有需要验证的改动。")),
         },
         {
             "title": "调试与临时内容",
@@ -1590,14 +1793,21 @@ def plain_language_report(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
-    cwd = Path(str(event.get("cwd") or state.get("cwd") or os.getcwd())).resolve()
-    config, config_warnings = load_config(cwd)
-    paths = [path for path in changed_paths(cwd) if not ignored(path, config["ignore_paths"])]
-    touched = [path for path in state.get("files_touched", []) if not ignored(path, config["ignore_paths"])]
-    all_paths = sorted(set(paths) if repo_root(cwd) is not None else set(touched))
+def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any] | None:
+    event_cwd = Path(str(event.get("cwd") or state.get("cwd") or os.getcwd())).resolve()
+    scope = determine_turn_scope(event_cwd, state)
+    if not scope["active"]:
+        return None
+    cwd = Path(scope["root"])
+    scope_kind = str(scope["kind"])
+    config, config_warnings = runtime_config(cwd, scope_kind)
+    all_paths = sorted({
+        path for path in scope["paths"]
+        if not ignored(path, config["ignore_paths"])
+    })
     code_paths = [path for path in all_paths if code_changed([path])]
-    relevant_code_changed = bool(code_paths)
+    protected_assets = all_paths if scope_kind == "global" else code_paths
+    relevant_code_changed = bool(protected_assets)
     verifications = state.get("verifications", [])
     fingerprint = cached_workspace_fingerprint(cwd, all_paths, config)
     current_fingerprint = fingerprint["fingerprint"]
@@ -1608,6 +1818,10 @@ def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     current_evidence = [
         item for item in verifications
         if item.get("workspace_fingerprint") == current_fingerprint
+        and (
+            not item.get("scope_root")
+            or Path(str(item.get("scope_root"))).resolve(strict=False) == cwd.resolve(strict=False)
+        )
         and item.get("fingerprint_complete", True)
         and fingerprint_complete
         and (
@@ -1686,16 +1900,21 @@ def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
                 blockers.append(
                     f"required verification {identifier} did not succeed for: " + ", ".join(covered[:5])
                 )
-    uncovered = sorted(set(code_paths) - covered_by_required) if required_rules else []
+    uncovered = sorted(set(protected_assets) - covered_by_required) if required_rules else []
     if uncovered:
         blockers.append(
             "changed code is not covered by a required verification rule: " + ", ".join(uncovered[:5])
         )
 
     if relevant_code_changed and config.get("require_verification_when_code_changed") and not successful:
-        blockers.append("code changed, but no successful test, lint, typecheck, or build was recorded after the latest observed edit")
+        missing_message = (
+            "protected engineering assets changed, but no successful test, lint, typecheck, or build was recorded after the latest observed edit"
+            if scope_kind == "global"
+            else "code changed, but no successful test, lint, typecheck, or build was recorded after the latest observed edit"
+        )
+        blockers.append(missing_message)
         if verifications and not current_evidence:
-            warnings.append("recorded verification evidence is stale because relevant code content changed")
+            warnings.append("recorded verification evidence is stale because relevant engineering content changed")
     if failed and config.get("block_on_failed_verification"):
         latest = failed[-1]
         blockers.append(f"the latest recorded {latest['kind']} command failed: {latest['command']}")
@@ -1708,7 +1927,8 @@ def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         warnings.append("some verification commands had an unknown exit status and were not counted as successful")
 
-    debug = added_debug_markers(cwd, paths, config)
+    debug_paths = [path for path in all_paths if not Path(path).is_absolute()]
+    debug = added_debug_markers(cwd, debug_paths, config)
     if debug["warnings"]:
         warnings.append("new debug or temporary markers found: " + "; ".join(debug["warnings"]))
     if debug["blockers"]:
@@ -1735,6 +1955,7 @@ def evaluate(event: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         "turn_id": str(event.get("turn_id") or "unknown"),
         "cwd": str(cwd),
         "project_name": cwd.name or str(cwd),
+        "scope_kind": scope_kind,
         "mode": config["mode"],
         "companion_enabled": config["companion_enabled"],
         "notification_policy": config["notification_policy"],
@@ -1774,6 +1995,47 @@ def report_identifier(report: dict[str, Any]) -> str:
     session = safe_id(str(report.get("session_id") or "unknown"))[:48]
     turn = safe_id(str(report.get("turn_id") or "unknown"))[:48]
     return f"{session}-{turn}-{digest}"
+
+
+def notification_signature(report: dict[str, Any]) -> str:
+    """Identify a completion state without treating every turn as a new issue."""
+    identity = json.dumps({
+        "cwd": str(Path(str(report.get("cwd") or "")).resolve(strict=False)),
+        "scope_kind": report.get("scope_kind"),
+        "workspace_fingerprint": report.get("workspace_fingerprint"),
+        "status": report_status(report),
+        "warnings": report.get("warnings", []),
+        "blockers": report.get("blockers", []),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(identity).hexdigest()
+
+
+def notification_cache_path() -> Path:
+    return plugin_data_dir() / "notification-cache.json"
+
+
+def notification_scope_key(report: dict[str, Any]) -> str:
+    value = str(Path(str(report.get("cwd") or "")).resolve(strict=False))
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def notification_is_duplicate(report: dict[str, Any]) -> bool:
+    cache = load_json(notification_cache_path(), {})
+    if not isinstance(cache, dict):
+        return False
+    item = cache.get(notification_scope_key(report))
+    return isinstance(item, dict) and item.get("signature") == notification_signature(report)
+
+
+def record_notification(report: dict[str, Any]) -> None:
+    cache = load_json(notification_cache_path(), {})
+    if not isinstance(cache, dict):
+        cache = {}
+    cache[notification_scope_key(report)] = {
+        "signature": notification_signature(report),
+        "delivered_at": now_iso(),
+    }
+    save_json(notification_cache_path(), cache)
 
 
 def write_text(path: Path, value: str) -> None:
@@ -1981,6 +2243,10 @@ def _handle_hook_locked(event: dict[str, Any]) -> dict[str, Any] | None:
 
     if hook_name == "UserPromptSubmit":
         state["prompt_count"] = int(state.get("prompt_count") or 0) + 1
+        state["turn_started_sequence"] = state["sequence"]
+        state["turn_files_touched"] = []
+        cwd = Path(str(event.get("cwd") or state.get("cwd") or os.getcwd())).resolve()
+        state["turn_git_baseline"] = git_workspace_snapshot(cwd)
         state.pop("last_prompt", None)
         save_json(path, state)
         return None
@@ -1989,13 +2255,25 @@ def _handle_hook_locked(event: dict[str, Any]) -> dict[str, Any] | None:
         tool_name = str(event.get("tool_name") or "")
         command = command_from_event(event)
         if tool_name == "apply_patch":
+            touched = absolute_patch_paths(event, state.get("cwd") or os.getcwd())
             paths = set(state.get("files_touched", []))
-            paths.update(patch_paths(command))
+            paths.update(touched)
             state["files_touched"] = sorted(paths)
+            turn_paths = set(state.get("turn_files_touched", []))
+            turn_paths.update(touched)
+            state["turn_files_touched"] = sorted(turn_paths)
             state["last_change_sequence"] = state["sequence"]
         elif tool_name == "Bash":
-            cwd = Path(str(event.get("cwd") or state.get("cwd") or os.getcwd())).resolve()
-            config, _ = load_config(cwd)
+            cwd = event_working_directory(event, state.get("cwd") or os.getcwd())
+            scope = determine_turn_scope(cwd, state)
+            if scope["active"]:
+                scope_root = Path(scope["root"])
+                scope_kind = str(scope["kind"])
+            else:
+                global_root = managed_global_root(cwd)
+                scope_root = global_root or guard_root(cwd)
+                scope_kind = "global" if global_root is not None else ("git" if repo_root(scope_root) is not None else "configured")
+            config, _ = runtime_config(scope_root, scope_kind)
             rule = match_verification(command, config, cwd)
             if rule:
                 exit_code = extract_exit_code(event.get("tool_response"))
@@ -2003,10 +2281,8 @@ def _handle_hook_locked(event: dict[str, Any]) -> dict[str, Any] | None:
                 if exit_code is None:
                     exit_code = transcript_exit_code(event, command)
                     exit_code_source = "transcript" if exit_code is not None else "unknown"
-                current_paths = changed_paths(cwd)
-                if repo_root(cwd) is None:
-                    current_paths = list(state.get("files_touched", []))
-                fingerprint = cached_workspace_fingerprint(cwd, current_paths, config)
+                current_paths = list(scope["paths"]) if scope["active"] else changed_paths(scope_root)
+                fingerprint = cached_workspace_fingerprint(scope_root, current_paths, config)
                 state.setdefault("verifications", []).append({
                     "sequence": state["sequence"],
                     "verification_id": rule["id"],
@@ -2017,6 +2293,8 @@ def _handle_hook_locked(event: dict[str, Any]) -> dict[str, Any] | None:
                     "exit_code": exit_code,
                     "exit_code_source": exit_code_source,
                     "success": None if exit_code is None else exit_code == 0,
+                    "scope_root": str(scope_root.resolve(strict=False)),
+                    "scope_kind": scope_kind,
                     "workspace_fingerprint": fingerprint["fingerprint"],
                     "fingerprint_complete": fingerprint["metrics"]["complete"],
                     "fingerprint_metrics": fingerprint["metrics"],
@@ -2030,6 +2308,8 @@ def _handle_hook_locked(event: dict[str, Any]) -> dict[str, Any] | None:
     if hook_name == "Stop":
         save_json(path, state)
         report = evaluate(event, state)
+        if report is None:
+            return None
         message = format_report(report)
         mode = report["mode"]
         strict_continuation = (
@@ -2039,16 +2319,27 @@ def _handle_hook_locked(event: dict[str, Any]) -> dict[str, Any] | None:
         )
         policy = report.get("notification_policy", "always")
         has_issue = bool(report["warnings"] or report["blockers"])
-        wants_popup = (
-            bool(report.get("companion_enabled"))
-            and mode != "observe"
+        wants_delivery = (
+            mode != "observe"
             and policy != "never"
             and (policy == "always" or has_issue)
             and not strict_continuation
         )
+        wants_popup = bool(report.get("companion_enabled")) and wants_delivery
+        duplicate_notification = wants_delivery and notification_is_duplicate(report)
         companion_available = companion_app_path().exists()
-        save_report(report, enqueue=wants_popup and companion_available)
-        delivered_to_companion = wants_popup and companion_available and launch_companion()
+        save_report(
+            report,
+            enqueue=wants_popup and not duplicate_notification and companion_available,
+        )
+        delivered_to_companion = (
+            wants_popup
+            and not duplicate_notification
+            and companion_available
+            and launch_companion()
+        )
+        if delivered_to_companion:
+            record_notification(report)
 
         if mode == "observe":
             return None
@@ -2057,10 +2348,15 @@ def _handle_hook_locked(event: dict[str, Any]) -> dict[str, Any] | None:
                 "decision": "block",
                 "reason": message + "\nBefore finishing, address the blocking evidence or explain why it cannot be produced."
             }
+        if not wants_delivery:
+            return None
+        if duplicate_notification:
+            return None
         if delivered_to_companion:
             return None
         if not report["changed_paths"] and not report["warnings"] and not report["blockers"]:
             return None
+        record_notification(report)
         return {"systemMessage": message}
 
     if hook_name == "SessionEnd":
