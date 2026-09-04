@@ -8,14 +8,46 @@ DoneGuard 以“本轮是否修改了受保护的工程资产”为触发条件�
 
 ## 安装和更新
 
-DoneGuard 当前通过个人 marketplace 安装。
+### 最省事的安装方法
+
+你不用自己下载文件，也不用打开终端。照着下面几步操作即可。
+
+1. 打开 Codex，确认当前任务使用本地环境。
+2. 新建一个任务。
+3. 复制下面方框里的全部文字。
+4. 把文字发给 Codex，等它安装完成。
+5. 如果 Codex 询问是否允许下载或安装，请先看清操作内容，再点击允许。
+
+```text
+请帮我安装 DoneGuard。
+项目地址是 https://github.com/ebon-gryphon/doneguard
+请把项目下载到 ~/plugins/doneguard，加入我的 Personal marketplace，安装插件，并在 macOS 上安装 Companion。完成后请检查是否安装成功，并告诉我结果。
+```
+
+看到安装成功的回复以后，再新建一个任务。DoneGuard 会从新任务开始工作。
+
+DoneGuard 目前还不能在公开插件目录里搜索。Personal marketplace 是保存在你电脑上的个人插件列表，公开插件商店是另一套目录。上面的安装过程会由 Codex 处理，不需要你事先配置 Personal marketplace。
+
+### 更新
+
+已经安装过 DoneGuard 时，也不用自己寻找文件。新建一个 Codex 任务，把下面这段话完整发给 Codex。
+
+```text
+请帮我更新 DoneGuard。
+项目地址是 https://github.com/ebon-gryphon/doneguard
+请下载最新版本，重新安装插件并更新 macOS Companion。完成后请检查是否更新成功，并告诉我结果。
+```
+
+更新完成后，再新建一个任务，让 Codex 加载新版 Skill 和 Hook。
+
+### 手动重新安装
+
+如果你只是想使用 DoneGuard，可以跳过这一节。下面的命令只适合已经把 DoneGuard 加入本机 Personal marketplace，并且熟悉终端的用户。
 
 ```bash
 codex plugin add doneguard@personal
 zsh /path/to/doneguard/scripts/install_companion_macos.sh
 ```
-
-更新插件后请新建 Codex 任务，让新任务加载新的 skill 和 hook。
 
 ## 它解决什么问题
 
