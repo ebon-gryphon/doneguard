@@ -62,6 +62,129 @@ class DoneGuardTests(unittest.TestCase):
         self.assertIn("systemMessage", result)
         self.assertIn("no successful test", result["systemMessage"])
 
+    def test_read_only_turn_is_silent_even_when_repository_is_dirty(self) -> None:
+        doneguard.handle_hook(self.event("SessionStart", source="startup"))
+        (self.repo / "app.py").write_text("def value():\n    return 2\n", encoding="utf-8")
+        doneguard.handle_hook(self.event("UserPromptSubmit", prompt="search for recent news"))
+        result = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
+        self.assertIsNone(result)
+        self.assertIsNone(doneguard.latest_report(self.repo))
+
+    def test_edit_after_prompt_activates_git_scope(self) -> None:
+        doneguard.handle_hook(self.event("SessionStart", source="startup"))
+        doneguard.handle_hook(self.event("UserPromptSubmit", prompt="update the implementation"))
+        (self.repo / "app.py").write_text("def value():\n    return 2\n", encoding="utf-8")
+        doneguard.handle_hook(self.event(
+            "PostToolUse",
+            tool_name="apply_patch",
+            tool_input={"command": "*** Update File: app.py"},
+        ))
+        result = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
+        self.assertIn("systemMessage", result)
+        report = doneguard.latest_report(self.repo)
+        self.assertEqual(report["scope_kind"], "git")
+        self.assertEqual(report["changed_paths"], ["app.py"])
+
+    def test_unconfigured_non_git_edit_is_silent(self) -> None:
+        plain = self.root / "plain"
+        plain.mkdir()
+        doneguard.handle_hook(self.event("SessionStart", cwd=str(plain), source="startup"))
+        doneguard.handle_hook(self.event("UserPromptSubmit", cwd=str(plain), prompt="edit a note"))
+        target = plain / "note.py"
+        target.write_text("VALUE = 1\n", encoding="utf-8")
+        doneguard.handle_hook(self.event(
+            "PostToolUse", cwd=str(plain), tool_name="apply_patch",
+            tool_input={"command": "*** Add File: note.py"},
+        ))
+        self.assertIsNone(doneguard.handle_hook(self.event("Stop", cwd=str(plain))))
+
+    def test_doneguard_config_opts_non_git_directory_in(self) -> None:
+        plain = self.root / "configured"
+        plain.mkdir()
+        (plain / ".doneguard.json").write_text('{"mode":"warn"}\n', encoding="utf-8")
+        doneguard.handle_hook(self.event("SessionStart", cwd=str(plain), source="startup"))
+        doneguard.handle_hook(self.event("UserPromptSubmit", cwd=str(plain), prompt="edit a script"))
+        target = plain / "tool.py"
+        target.write_text("VALUE = 1\n", encoding="utf-8")
+        doneguard.handle_hook(self.event(
+            "PostToolUse", cwd=str(plain), tool_name="apply_patch",
+            tool_input={"command": "*** Add File: tool.py"},
+        ))
+        result = doneguard.handle_hook(self.event("Stop", cwd=str(plain)))
+        self.assertIn("systemMessage", result)
+        self.assertEqual(doneguard.latest_report(plain)["scope_kind"], "configured")
+
+    def test_global_skill_edit_is_protected_outside_git(self) -> None:
+        plain = self.root / "plain"
+        skill = self.root / "codex-home" / "skills" / "demo" / "SKILL.md"
+        plain.mkdir()
+        skill.parent.mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.root / "codex-home")}, clear=False):
+            doneguard.handle_hook(self.event("SessionStart", cwd=str(plain), source="startup"))
+            doneguard.handle_hook(self.event("UserPromptSubmit", cwd=str(plain), prompt="update my skill"))
+            skill.write_text("# Demo\n", encoding="utf-8")
+            doneguard.handle_hook(self.event(
+                "PostToolUse", cwd=str(plain), tool_name="apply_patch",
+                tool_input={"command": f"*** Add File: {skill}"},
+            ))
+            result = doneguard.handle_hook(self.event("Stop", cwd=str(plain)))
+            self.assertIn("全局工程配置改动后还没有验证", result["systemMessage"])
+            report = doneguard.latest_report(self.root / "codex-home")
+            self.assertEqual(report["scope_kind"], "global")
+            self.assertEqual(report["changed_paths"], ["skills/demo/SKILL.md"])
+
+    def test_external_git_repository_edit_uses_edited_repository_scope(self) -> None:
+        external = self.root / "external-repo"
+        external.mkdir()
+        subprocess.run(["git", "init", "-q", str(external)], check=True)
+        subprocess.run(["git", "-C", str(external), "config", "user.email", "doneguard@example.test"], check=True)
+        subprocess.run(["git", "-C", str(external), "config", "user.name", "DoneGuard Test"], check=True)
+        target = external / "tool.py"
+        target.write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(external), "add", "tool.py"], check=True)
+        subprocess.run(["git", "-C", str(external), "commit", "-qm", "initial"], check=True)
+
+        doneguard.handle_hook(self.event("SessionStart", source="startup"))
+        doneguard.handle_hook(self.event("UserPromptSubmit", prompt="edit the other repository"))
+        target.write_text("VALUE = 2\n", encoding="utf-8")
+        doneguard.handle_hook(self.event(
+            "PostToolUse", tool_name="apply_patch",
+            tool_input={"command": f"*** Update File: {target}"},
+        ))
+        result = doneguard.handle_hook(self.event("Stop"))
+        self.assertIn("systemMessage", result)
+        report = doneguard.latest_report(external)
+        self.assertEqual(Path(report["cwd"]).resolve(), external.resolve())
+        self.assertEqual(report["changed_paths"], ["tool.py"])
+
+    def test_shell_only_git_change_is_detected_from_prompt_baseline(self) -> None:
+        doneguard.handle_hook(self.event("SessionStart", source="startup"))
+        doneguard.handle_hook(self.event("UserPromptSubmit", prompt="rewrite using a script"))
+        (self.repo / "app.py").write_text("def value():\n    return 9\n", encoding="utf-8")
+        doneguard.handle_hook(self.event(
+            "PostToolUse", tool_name="Bash",
+            tool_input={"command": "python3 rewrite.py"},
+            tool_response={"exit_code": 0},
+        ))
+        result = doneguard.handle_hook(self.event("Stop"))
+        self.assertIn("systemMessage", result)
+        self.assertEqual(doneguard.latest_report(self.repo)["changed_paths"], ["app.py"])
+
+    def test_same_completion_state_is_not_notified_twice(self) -> None:
+        doneguard.handle_hook(self.event("SessionStart", source="startup"))
+        doneguard.handle_hook(self.event("UserPromptSubmit", prompt="edit code"))
+        (self.repo / "app.py").write_text("def value():\n    return 2\n", encoding="utf-8")
+        patch = self.event(
+            "PostToolUse", tool_name="apply_patch",
+            tool_input={"command": "*** Update File: app.py"},
+        )
+        doneguard.handle_hook(patch)
+        self.assertIn("systemMessage", doneguard.handle_hook(self.event("Stop")))
+
+        doneguard.handle_hook(self.event("UserPromptSubmit", turn_id="turn-2", prompt="touch it again"))
+        doneguard.handle_hook({**patch, "turn_id": "turn-2"})
+        self.assertIsNone(doneguard.handle_hook(self.event("Stop", turn_id="turn-2")))
+
     def test_strict_mode_requests_one_continuation(self) -> None:
         (self.repo / ".doneguard.json").write_text('{"mode":"strict"}\n', encoding="utf-8")
         self.start_and_edit()
@@ -160,6 +283,21 @@ class DoneGuardTests(unittest.TestCase):
         result = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
         self.assertIsNone(result)
         self.assertIsNotNone(doneguard.latest_report(self.repo))
+
+    def test_issues_only_policy_keeps_successful_turn_silent(self) -> None:
+        (self.repo / ".doneguard.json").write_text(
+            '{"notification_policy":"issues_only"}\n', encoding="utf-8"
+        )
+        self.start_and_edit()
+        doneguard.handle_hook(self.event(
+            "PostToolUse",
+            tool_name="Bash",
+            tool_input={"command": "pytest -q"},
+            tool_response={"exit_code": 0, "output": "1 passed"},
+        ))
+        result = doneguard.handle_hook(self.event("Stop", stop_hook_active=False))
+        self.assertIsNone(result)
+        self.assertEqual(doneguard.latest_report(self.repo)["status"], "success")
 
     def test_without_companion_keeps_inline_fallback_and_only_latest_report(self) -> None:
         self.start_and_edit()
