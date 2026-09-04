@@ -1,6 +1,6 @@
 {
   "name": "doneguard",
-  "version": "0.1.0+codex.20260904080041",
+  "version": "0.1.0+codex.20260904084934",
   "description": "Verify completion evidence and optionally show it in a macOS capybara companion.",
   "author": {
     "name": "DoneGuard"
