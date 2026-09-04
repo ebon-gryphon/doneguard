@@ -5,7 +5,9 @@ description: Configure or explain DoneGuard completion checks for Codex. Use whe
 
 # DoneGuard
 
-DoneGuard is a local, Git-aware completion guard. Its hooks record supported verification commands and inspect the working tree before Codex stops. Successful verification is tied to a fingerprint of the relevant changed code, so later edits invalidate older evidence regardless of which editing tool produced them.
+DoneGuard is a local completion guard for Git projects and protected Codex engineering assets. Its hooks record supported verification commands and inspect changes from the current user turn before Codex stops. Successful verification is tied to a fingerprint of the relevant changed content, so later edits invalidate older evidence regardless of which editing tool produced them.
+
+Read-only turns must stay silent even when the current Git repository already contains unrelated dirty files. A report is eligible only when the current turn changes a protected scope or runs verification for one. Protected scopes are Git repositories, non-Git directories explicitly opted in with `.doneguard.json`, global Codex skills/plugins/bin/configuration under `CODEX_HOME`, and global agent skills/plugins under `~/.agents`. Determine the scope from the edited files rather than assuming every edit belongs to the chat's starting directory. Identical workspace findings should not notify repeatedly until the fingerprint or findings change.
 
 ## Modes
 
